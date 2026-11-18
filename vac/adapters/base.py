@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 BODY_EXCERPT_CHARS = 2000
+MAX_CONCURRENCY = 5  # hard cap on in-flight requests + open WS sessions per adapter; not configurable
 
 
 @dataclass

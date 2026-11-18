@@ -10,10 +10,10 @@ import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
-from vac.adapters.base import HttpCapture, StreamCapture, TTSRequest, WSCapture, collect_ids
+from vac.adapters.base import MAX_CONCURRENCY, HttpCapture, StreamCapture, TTSRequest, WSCapture, collect_ids
 from vac.evidence import now_stamps
 
-HTTP_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
+HTTP_TIMEOUT = httpx.Timeout(120.0, connect=10.0)  # at-limit (8000 char) sync synthesis is slow
 
 
 def _ms() -> float:
@@ -38,6 +38,7 @@ class SmallestTTS:
         self._header_ids = vendor["request_id_fields"]["headers"]
         self._frame_ids = vendor["request_id_fields"]["frames"]
         self._client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, transport=transport)
+        self._slots = asyncio.Semaphore(MAX_CONCURRENCY)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -69,21 +70,23 @@ class SmallestTTS:
         url = "ws" + self.base_url.removeprefix("http") + "/tts/live"
         if url_params:
             url += "?" + urlencode(url_params)
-        return SmallestWSSession(url, self._auth_headers, self._frame_ids)
+        return SmallestWSSession(url, self._auth_headers, self._frame_ids, self._slots)
 
     async def _post(self, cap: HttpCapture, req: TTSRequest, read_body) -> None:
-        cap.ts_utc, cap.ts_ist = now_stamps()
-        cap.timings_ms["t_send"] = _ms()
-        try:
-            async with self._client.stream("POST", cap.url, json=self.body(req), headers=self._auth_headers) as resp:
-                cap.timings_ms["t_headers"] = _ms()
-                cap.status = resp.status_code
-                cap.headers = dict(resp.headers)
-                collect_ids(cap.server_ids, cap.headers, self._header_ids)
-                await read_body(cap, resp)
-        except httpx.HTTPError as exc:
-            cap.error = f"{type(exc).__name__}: {exc}"
-        cap.timings_ms["t_end"] = _ms()
+        async with self._slots:
+            cap.ts_utc, cap.ts_ist = now_stamps()
+            cap.timings_ms["t_send"] = _ms()
+            try:
+                async with self._client.stream("POST", cap.url, json=self.body(req),
+                                               headers=self._auth_headers) as resp:
+                    cap.timings_ms["t_headers"] = _ms()
+                    cap.status = resp.status_code
+                    cap.headers = dict(resp.headers)
+                    collect_ids(cap.server_ids, cap.headers, self._header_ids)
+                    await read_body(cap, resp)
+            except httpx.HTTPError as exc:
+                cap.error = f"{type(exc).__name__}: {exc}"
+            cap.timings_ms["t_end"] = _ms()
 
     async def _read_sync(self, cap: HttpCapture, resp: httpx.Response) -> None:
         chunks = []
@@ -129,10 +132,12 @@ class SmallestTTS:
 class SmallestWSSession:
     """One WebSocket connection; every frame in either direction is captured with a timestamp."""
 
-    def __init__(self, url: str, headers: dict, frame_id_fields: list[str]):
+    def __init__(self, url: str, headers: dict, frame_id_fields: list[str], slots: asyncio.Semaphore):
         self.capture = WSCapture(url=url)
         self._headers = headers
         self._frame_ids = frame_id_fields
+        self._slots = slots
+        self._holding = False
         self._ws = None
 
     async def __aenter__(self):
@@ -142,6 +147,9 @@ class SmallestWSSession:
         await self.close()
 
     async def open(self, timeout: float = 10) -> bool:
+        """Connect; the session holds one concurrency slot from here until it closes."""
+        await self._slots.acquire()
+        self._holding = True
         cap = self.capture
         cap.ts_utc, cap.ts_ist = now_stamps()
         cap.timings_ms["t_connect_start"] = _ms()
@@ -154,9 +162,11 @@ class SmallestWSSession:
             cap.frames.append({"t_ms": _ms(), "direction": "recv", "kind": "handshake_body",
                                "data": _parse_json(exc.response.body) or exc.response.body.decode("utf-8", "replace")})
             cap.error = f"InvalidStatus: {exc}"
+            self._release()
             return False
         except (OSError, asyncio.TimeoutError, websockets.exceptions.InvalidHandshake) as exc:
             cap.error = f"{type(exc).__name__}: {exc}"
+            self._release()
             return False
         cap.timings_ms["t_open"] = _ms()
         cap.handshake_status = self._ws.response.status_code
@@ -217,8 +227,14 @@ class SmallestWSSession:
             await self._ws.close()
             self._record_close()
 
+    def _release(self) -> None:
+        if self._holding:
+            self._holding = False
+            self._slots.release()
+
     def _record_close(self) -> None:
         cap = self.capture
+        self._release()
         if cap.closed_by is not None:
             return
         cap.timings_ms["t_closed"] = _ms()
