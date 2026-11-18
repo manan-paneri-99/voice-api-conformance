@@ -1,0 +1,12 @@
+# Example product: a customer-support voice agent speaking replies over WebSocket.
+product: example
+voice: magnus            # docs example voice; confirm against the voices endpoint in step 2
+sample_rate: 24000
+transport: ws
+inputs:
+  short: "Your order has shipped."
+  typical: "Thanks for waiting. I checked your order, and it left our warehouse this morning. It should reach you by Thursday evening. I've sent the tracking link to your email. Is there anything else I can help with?"
+slo:
+  ttfa_p95_ms: 300
+  success_rate: 0.999
+budget: {max_chars_total: 200000}

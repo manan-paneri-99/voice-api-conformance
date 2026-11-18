@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.DS_Store
+
+# private pilot material: vendor docs snapshot, evidence, report drafts
+pilot/
+evidence/
