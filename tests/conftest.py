@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
@@ -21,6 +22,23 @@ def vendor():
 
 
 @pytest.fixture
+def fast_ws(vendor, monkeypatch):
+    """Shrink documented WS timings ~100x so idle/backoff checks run in about a second."""
+    claims = vendor["claims"]
+    claims["tts.ws.idle_timeout_s"] = {**claims["tts.ws.idle_timeout_s"], "default": 0.6, "max": 1.0}
+    claims["tts.ws.complete_backoff_ms"] = {**claims["tts.ws.complete_backoff_ms"], "default": 300}
+    monkeypatch.setattr(checks, "TOLERANCE_S", (0.1, 0.3))
+    monkeypatch.setattr(checks, "IDLE_GRACE_S", 0.5)
+    monkeypatch.setattr(checks.WSIdleTimeout, "PING_AT_S", 0.3)
+    monkeypatch.setattr(checks.WSIdleTimeout, "CASES", (
+        ("timeout_05", {"timeout": 0.5}, False, False), ("ping_resets", {"timeout": 0.5}, True, False),
+        ("default", {}, False, True), ("timeout_2", {"timeout": 2}, False, True)))
+    monkeypatch.setattr(checks.WSLifecycle, "CLOSE_WAIT_S", 0.5)
+    monkeypatch.setattr(checks.WSLifecycle, "BACKOFFS", (0, 200, None, 10001))
+    return vendor
+
+
+@pytest.fixture
 def product():
     return yaml.safe_load((ROOT / "profiles/products/example.yaml").read_text())
 
@@ -36,6 +54,9 @@ class DocsServer:
     def __init__(self, max_active=1, delay=0.05):
         self.max_active, self.delay = max_active, delay
         self.active = self.peak = 0
+        self.idle_default_s, self.idle_max_s = 60, 180
+        self.backoff_default_ms = 4000
+        self.close_after_complete = True
 
     def invalid(self, body):
         if not body["text"].strip():
@@ -48,6 +69,8 @@ class DocsServer:
             return "bad sample_rate"
         if body["voice_id"] == checks.UNKNOWN_VOICE:
             return "unknown voice"
+        if not 0 <= body.get("complete_backoff_ms", 0) <= 10000:
+            return "bad complete_backoff_ms"
         return None
 
     async def http(self, request: httpx.Request):
@@ -68,28 +91,51 @@ class DocsServer:
         return httpx.Response(200, content=b"\x01\x02" * 10, headers={"content-type": "audio/wav"})
 
     async def ws(self, conn):
-        body = json.loads(await conn.recv())
-        if (reason := self.invalid(body)) is not None:
-            await conn.send(json.dumps({"status": "error", "message": reason}))
-            await conn.close(1000)
-            return
-        if self.active >= self.max_active:
-            await conn.send(json.dumps({"status": "error", "message": "busy"}))
-            await conn.close(1000)
-            return
-        self.active += 1
-        try:
-            await asyncio.sleep(self.delay)
-            await conn.send(json.dumps({"status": "chunk", "data": {"audio": B64}}))
-            await conn.send(json.dumps({"status": "complete"}))
-        finally:
-            self.active -= 1
-        await conn.close(1000)
+        query = parse_qs(urlparse(conn.request.path).query)
+        idle = min(float(query["timeout"][0]), self.idle_max_s) if "timeout" in query else self.idle_default_s
+        while True:
+            try:
+                body = json.loads(await asyncio.wait_for(conn.recv(), idle))
+            except asyncio.TimeoutError:
+                await conn.send(json.dumps({"status": "error",
+                                            "message": f"Connection timed out after {idle:g} seconds of inactivity"}))
+                await conn.close(1000)
+                return
+            except websockets.ConnectionClosed:
+                return
+            if body.get("type") == "ping":
+                await conn.send(json.dumps({"type": "pong"}))
+                continue
+            if (reason := self.invalid(body)) is not None:
+                await conn.send(json.dumps({"status": "error", "message": reason}))
+                await conn.close(1000)
+                return
+            if self.active >= self.max_active:
+                await conn.send(json.dumps({"status": "error", "message": "busy"}))
+                await conn.close(1000)
+                return
+            self.active += 1
+            try:
+                await asyncio.sleep(self.delay)
+                await conn.send(json.dumps({"status": "chunk", "data": {"audio": B64}}))
+                await asyncio.sleep(body.get("complete_backoff_ms", self.backoff_default_ms) / 1000)
+                await conn.send(json.dumps({"status": "complete"}))
+            finally:
+                self.active -= 1
+            if self.close_after_complete:
+                await conn.close(1000)
+                return
 
 
 @pytest.fixture
-async def docs_server(vendor):
+async def docs_server(vendor, request):
     server = DocsServer()
+    if "fast_ws" in request.fixturenames:
+        server.idle_default_s = vendor["claims"]["tts.ws.idle_timeout_s"]["default"]
+        server.idle_max_s = vendor["claims"]["tts.ws.idle_timeout_s"]["max"]
+        server.backoff_default_ms = vendor["claims"]["tts.ws.complete_backoff_ms"]["default"]
+    else:
+        server.backoff_default_ms = 0
     async with websockets.serve(server.ws, "127.0.0.1", 0) as ws:
         port = ws.sockets[0].getsockname()[1]
         local = {**vendor, "base_url": f"http://127.0.0.1:{port}"}

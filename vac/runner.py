@@ -82,14 +82,21 @@ async def run_checks(adapter, vendor: dict, product: dict, check_ids: list[str],
         ctx = Ctx(adapter, vendor, product, run_id, writer)
         for check, n, _, _ in plan:
             outcomes = Counter()
-            for i in range(n):
-                for rec in await check.run(ctx, i):
-                    writer.write(rec)
-                    outcomes[rec["outcome"]] += 1
-                    ids = {k: v for k, v in rec["server_ids"].items() if v}
-                    print(writer.masked(f"  {rec['case']} i={i} status={rec['status']} outcome={rec['outcome']} "
-                                        f"observed={rec['observed']} ids={ids}"
-                                        + (f" error={rec['error']}" if rec["error"] else "")))
+
+            def emit(rec):
+                writer.write(rec)
+                outcomes[rec["outcome"]] += 1
+                ids = {k: v for k, v in rec["server_ids"].items() if v}
+                print(writer.masked(f"  {rec['case']} i={rec['iteration']} status={rec['status']} "
+                                    f"outcome={rec['outcome']} observed={rec['observed']} ids={ids}"
+                                    + (f" error={rec['error']}" if rec["error"] else "")), flush=True)
+
+            if hasattr(check, "run_all"):
+                await check.run_all(ctx, n, emit)
+            else:
+                for i in range(n):
+                    for rec in await check.run(ctx, i):
+                        emit(rec)
             print(f"{check.id}: " + ", ".join(f"{k}={v}" for k, v in sorted(outcomes.items())) + " (per request)")
     print(f"evidence: {writer.path}")
     return writer.path

@@ -74,3 +74,54 @@ async def test_error_shape_mismatch_on_other_shape(docs_server, vendor, product,
     recs = await _run(docs_server, vendor, product, "tts.error_shape", tmp_path, runs=1)
     http = [r for r in recs if r["transport"] != "ws"]
     assert {r["outcome"] for r in http} == {"mismatch"} and http[0]["observed"]["keys"] == ["detail", "error_code"]
+
+
+async def test_ws_idle_timeout_matches_docs_server(fast_ws, docs_server, product, tmp_path):
+    recs = await _run(docs_server, fast_ws, product, "tts.ws_idle_timeout", tmp_path, runs=2)
+    assert len(recs) == 8 and {r["outcome"] for r in recs} == {"match"}
+    by_case = {r["case"]: r for r in recs}
+    assert by_case["timeout_2"]["expected"]["idle_close_s"] == 1.0
+    assert by_case["ping_resets"]["observed"]["pong"] is True
+    assert by_case["ping_resets"]["observed"]["open_to_close_s"] > 0.7
+    assert "inactivity" in by_case["default"]["observed"]["error_message"]
+
+
+async def test_ws_idle_timeout_mismatch_when_not_clamped(fast_ws, docs_server, product, tmp_path):
+    docs_server.idle_max_s = 10
+    recs = await _run(docs_server, fast_ws, product, "tts.ws_idle_timeout", tmp_path, runs=1)
+    clamped = next(r for r in recs if r["case"] == "timeout_2")
+    assert clamped["outcome"] == "mismatch" and clamped["observed"]["closed_by"] == "client"
+
+
+async def test_ws_lifecycle_matches_docs_server(fast_ws, docs_server, product, tmp_path):
+    recs = await _run(docs_server, fast_ws, product, "tts.ws_lifecycle", tmp_path, runs=1)
+    assert [r["case"] for r in recs] == ["backoff_0", "backoff_200", "backoff_default", "backoff_10001"]
+    assert {r["outcome"] for r in recs} == {"match"}
+    assert 150 <= recs[1]["observed"]["gap_ms"] <= 500
+    assert recs[2]["observed"]["reuse"] == "closed_by_server"
+    assert recs[3]["observed"]["terminal"] == "error"
+
+
+async def test_ws_lifecycle_mismatch_when_server_keeps_socket_open(fast_ws, docs_server, product, tmp_path):
+    docs_server.close_after_complete = False
+    recs = await _run(docs_server, fast_ws, product, "tts.ws_lifecycle", tmp_path, runs=1)
+    default = next(r for r in recs if r["case"] == "backoff_default")
+    assert default["outcome"] == "mismatch" and default["observed"]["checks"]["server_closed"] is False
+    assert default["observed"]["reuse"] == "complete" and default["chars_sent"] == 2 * len(product["inputs"]["short"])
+    assert next(r for r in recs if r["case"] == "backoff_10001")["outcome"] == "match"
+
+
+async def test_ws_idle_timeout_records_reach_disk_before_check_ends(fast_ws, docs_server, product, tmp_path,
+                                                                     monkeypatch):
+    from vac.checks import tts
+
+    seen = []
+    original = tts.WSIdleTimeout._one
+
+    async def spy(self, ctx, *args):
+        seen.append(len(ctx.writer.path.read_text().splitlines()))
+        return await original(self, ctx, *args)
+
+    monkeypatch.setattr(tts.WSIdleTimeout, "_one", spy)
+    await _run(docs_server, fast_ws, product, "tts.ws_idle_timeout", tmp_path, runs=1)
+    assert seen == [1, 2, 3, 4]  # header, then each earlier case's record is on disk before the next starts

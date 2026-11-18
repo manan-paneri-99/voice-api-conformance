@@ -1,7 +1,8 @@
 """TTS checks. Each reads its expectation from the vendor profile and records expected vs observed per request.
 
-A check has: id, default_runs, estimate(vendor, product, n) -> (requests, chars upper bound),
-and async run(ctx, iteration) -> list of evidence records.
+A check has: id, default_runs, estimate(vendor, product, n) -> (requests, chars upper bound), and either
+async run(ctx, iteration) -> list of evidence records, or async run_all(ctx, n, emit) that schedules its own
+iterations and calls emit(record) as each one finishes.
 Outcomes: match | mismatch | inconclusive (the procedure didn't produce the condition it tests) | observed.
 """
 
@@ -11,6 +12,8 @@ TRANSPORTS = ("sync", "sse", "ws")
 ROUND_PAUSE_S = 2.0
 INVALID_SAMPLE_RATE = 22050
 UNKNOWN_VOICE = "vac-no-such-voice"
+TOLERANCE_S = (0.5, 2.0)  # a timing matches if it lands in [expected - 0.5 s, expected + 2 s]
+IDLE_GRACE_S = 15.0  # how long past the expected idle close we keep waiting before closing ourselves
 
 
 def _terminal(frame: dict) -> bool:
@@ -261,5 +264,146 @@ class ErrorShape:
         return records
 
 
-CHECKS = {c.id: c for c in (Smoke(), Concurrency(), Limits(), ErrorShape())}
-ALL = ("tts.concurrency", "tts.limits", "tts.error_shape")
+def _within(measured_s: float | None, expected_s: float) -> bool:
+    return measured_s is not None and expected_s - TOLERANCE_S[0] <= measured_s <= expected_s + TOLERANCE_S[1]
+
+
+def _ws_error_message(cap) -> str | None:
+    errors = [f["data"] for f in cap.frames
+              if f["direction"] == "recv" and isinstance(f["data"], dict) and f["data"].get("status") == "error"]
+    return errors[-1].get("message") if errors else None
+
+
+class WSIdleTimeout:
+    """Open a socket and send nothing (or one ping); measure when and how the server closes it."""
+    id = "tts.ws_idle_timeout"
+    default_runs = 5
+    PING_AT_S = 3.0
+    # (case, url params, ping?, run the n sockets in parallel?)
+    CASES = (("timeout_5", {"timeout": 5}, False, False),
+             ("ping_resets", {"timeout": 5}, True, False),
+             ("default", {}, False, True),
+             ("timeout_200", {"timeout": 200}, False, True))
+
+    def estimate(self, vendor, product, n):
+        return n * len(self.CASES), 0
+
+    def _expected_s(self, claim: dict, params: dict) -> float:
+        if claim["param"] not in params:
+            return claim["default"]
+        return min(params[claim["param"]], claim["max"])
+
+    async def run_all(self, ctx, n, emit):
+        """Sequential cases one socket at a time; parallel cases hold n idle sockets at once. Each record is
+        emitted as soon as its socket closes."""
+        claim = ctx.claim("tts.ws.idle_timeout_s")
+        for case, params, ping, parallel in self.CASES:
+            runs = [self._one(ctx, claim, case, params, ping, i, emit) for i in range(n)]
+            if parallel:
+                await asyncio.gather(*runs)
+            else:
+                for run in runs:
+                    await run
+
+    async def _one(self, ctx, claim, case, params, ping, i, emit):
+        expected_s = self._expected_s(claim, params)
+        req = ctx.request(self.id, "ws", i, "", case)
+        async with ctx.adapter.ws_session(params) as session:
+            if await session.open():
+                if ping and not await session.wait_close(self.PING_AT_S):
+                    await session.send_json({"type": "ping"})
+                await session.wait_close(expected_s + IDLE_GRACE_S)
+        cap = session.capture
+        sends = [f["t_ms"] for f in cap.frames if f["direction"] == "send"]
+        last_client_msg = sends[-1] if sends else cap.timings_ms.get("t_open")
+        t_closed = cap.timings_ms.get("t_closed")
+        idle_s = round((t_closed - last_client_msg) / 1000, 2) if t_closed and last_client_msg else None
+        pong = any(f["direction"] == "recv" and f.get("data") == {"type": "pong"} for f in cap.frames)
+        expected = {"idle_close_s": expected_s, "tolerance_s": list(TOLERANCE_S), "closed_by": "server"} | (
+            {"pong": True} if ping else {})
+        observed = {"idle_s": idle_s, "closed_by": cap.closed_by, "close_code": cap.close_code,
+                    "close_reason": cap.close_reason, "error_message": _ws_error_message(cap),
+                    "open_to_close_s": round((t_closed - cap.timings_ms["t_open"]) / 1000, 2)
+                    if t_closed and "t_open" in cap.timings_ms else None} | ({"pong": pong} if ping else {})
+        observed["checks"] = {"timing": _within(idle_s, expected_s), "server_closed": cap.closed_by == "server"} | (
+            {"pong": pong} if ping else {})
+        if cap.handshake_status != 101:
+            outcome = "inconclusive"
+        else:
+            outcome = "match" if all(observed["checks"].values()) else "mismatch"
+        emit(ctx.record(cap, self.id, i, req, case=case, expected=expected, observed=observed, outcome=outcome))
+
+
+class WSLifecycle:
+    """One synthesis per socket with varied complete_backoff_ms: gap to `complete`, then does the server close?"""
+    id = "tts.ws_lifecycle"
+    default_runs = 5
+    CLOSE_WAIT_S = 10.0
+    BACKOFFS = (0, 1000, None, 10000, 10001)  # None = omit the field (documented default)
+
+    def estimate(self, vendor, product, n):
+        short = len(product["inputs"]["short"])
+        return n * (len(self.BACKOFFS) + 1), n * (len(self.BACKOFFS) + 1) * short
+
+    async def run(self, ctx, i):
+        claim = ctx.claim("tts.ws.complete_backoff_ms")
+        text = ctx.product["inputs"]["short"]
+        records = []
+        for backoff in self.BACKOFFS:
+            case = "backoff_default" if backoff is None else f"backoff_{backoff}"
+            extra = {} if backoff is None else {"complete_backoff_ms": backoff}
+            req = ctx.request(self.id, "ws", i, text, case, extra=extra)
+            reuse_req = ctx.request(self.id, "ws", i, text, f"{case}-reuse") if backoff is None else None
+            reuse = None
+            async with ctx.adapter.ws_session({}) as session:
+                if await session.open():
+                    await session.send_json(ctx.adapter.body(req))
+                    first = await session.recv_until(_terminal, timeout=30)
+                    if first and reuse_req:
+                        await session.send_json(ctx.adapter.body(reuse_req))
+                        second = await session.recv_until(_terminal, timeout=30)
+                        closed_by = session.capture.closed_by
+                        reuse = second["data"]["status"] if second else (
+                            f"closed_by_{closed_by}" if closed_by else "no_terminal")
+                    if first:
+                        await session.wait_close(self.CLOSE_WAIT_S)
+            cap = session.capture
+            invalid = backoff is not None and not 0 <= backoff <= claim["max"]
+            observed = self._observe(cap) | ({"reuse": reuse} if reuse_req else {})
+            if invalid:
+                expected = {"terminal": "error", "basis": f"complete_backoff_ms max {claim['max']}"}
+                ok = observed["terminal"] == "error"
+            else:
+                expected_ms = claim["default"] if backoff is None else backoff
+                expected = {"terminal": "complete", "gap_ms": expected_ms, "tolerance_s": list(TOLERANCE_S),
+                            "closed_by": "server", "within_s": self.CLOSE_WAIT_S}
+                gap = observed["gap_ms"]
+                observed["checks"] = {"terminal": observed["terminal"] == "complete",
+                                      "gap": gap is not None and _within(gap / 1000, expected_ms / 1000),
+                                      "server_closed": cap.closed_by == "server"}
+                ok = all(observed["checks"].values())
+            outcome = "inconclusive" if cap.handshake_status != 101 else ("match" if ok else "mismatch")
+            rec = ctx.record(cap, self.id, i, req, case=case, expected=expected, observed=observed, outcome=outcome)
+            if reuse == "complete":
+                rec["chars_sent"] += len(reuse_req.text)
+            records.append(rec)
+        return records
+
+    @staticmethod
+    def _observe(cap) -> dict:
+        recv = [f for f in cap.frames if f["direction"] == "recv" and isinstance(f.get("data"), dict)]
+        first_terminal = next((f for f in recv if _terminal(f)), None)
+        chunks = [f for f in recv if f["data"].get("status") == "chunk"
+                  and (first_terminal is None or f["t_ms"] < first_terminal["t_ms"])]
+        t_closed = cap.timings_ms.get("t_closed")
+        return {"terminal": first_terminal["data"]["status"] if first_terminal else None,
+                "chunks": len(chunks),
+                "gap_ms": round(first_terminal["t_ms"] - chunks[-1]["t_ms"]) if first_terminal and chunks else None,
+                "error_message": _ws_error_message(cap),
+                "closed_by": cap.closed_by, "close_code": cap.close_code,
+                "terminal_to_close_s": round((t_closed - first_terminal["t_ms"]) / 1000, 2)
+                if t_closed and first_terminal else None}
+
+
+CHECKS = {c.id: c for c in (Smoke(), Concurrency(), Limits(), ErrorShape(), WSIdleTimeout(), WSLifecycle())}
+ALL = ("tts.concurrency", "tts.limits", "tts.error_shape", "tts.ws_idle_timeout", "tts.ws_lifecycle")
