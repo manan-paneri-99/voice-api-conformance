@@ -3,7 +3,7 @@ vendor: smallest
 base_url: https://api.smallest.ai/waves/v1
 model: lightning_v3.1_pro
 auth: {header: Authorization, scheme: Bearer, env: SMALLEST_API_KEY}
-request_id_fields: {headers: [x-request-id, X-External-Request-Id], frames: [request_id, session_id]}
+request_id_fields: {headers: [x-request-id, X-External-Request-Id, X-External-Session-Id], frames: [request_id, session_id, external_request_id, external_session_id]}
 claims:
   tts.concurrency.max_active: {value: 1, on_exceed: 429, source: https://docs.smallest.ai/api-reference/concurrency-and-limits}
   tts.text.max_chars:         {value: 8000, source: https://docs.smallest.ai/models/api-reference/text-to-speech/synthesize-speech-sse}

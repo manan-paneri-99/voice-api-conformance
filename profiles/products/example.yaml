@@ -1,6 +1,6 @@
 # Example product: a customer-support voice agent speaking replies over WebSocket.
 product: example
-voice: magnus            # docs example voice; confirm against the voices endpoint in step 2
+voice: meher             # documented Pro catalog voice (lightning_v3.1_pro model card)
 sample_rate: 24000
 transport: ws
 inputs:

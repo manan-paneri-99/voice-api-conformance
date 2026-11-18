@@ -17,4 +17,4 @@ Start of every session:
 Python 3.11+, asyncio, httpx, websockets, pyyaml, python-dotenv, argparse. Venv in `.venv` (`python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'`). Tests: `.venv/bin/pytest` (offline only).
 
 ## Current step
-Step 1 (skeleton + evidence) — done: `vac/evidence.py`, `vac/profiles.py`, both YAML profiles, offline tests pass. Next: Step 2 (Smallest adapter + smoke).
+Step 2 (Smallest adapter + smoke) — done: `vac/adapters/`, `vac smoke` (sync, SSE, WS), live smoke passed. Next: Step 3 (runner + first checks).

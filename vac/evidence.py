@@ -79,6 +79,9 @@ class EvidenceWriter:
     def write(self, record: dict) -> None:
         self._write({"record": "request", **record})
 
+    def masked(self, value):
+        return mask(value, self.known_secrets)
+
     def _write(self, record: dict) -> None:
         line = json.dumps(mask({"run_id": self.run_id, **record}, self.known_secrets), ensure_ascii=False)
         self._file.write(line + "\n")
