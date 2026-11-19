@@ -1,6 +1,7 @@
 # Documented claims for Smallest TTS (Waves/Models API). Hypotheses until a live run confirms them.
 vendor: smallest
 base_url: https://api.smallest.ai/waves/v1
+token_url: https://api.smallest.ai/console/v1/auth/token
 model: lightning_v3.1_pro
 auth: {header: Authorization, scheme: Bearer, env: SMALLEST_API_KEY}
 request_id_fields: {headers: [x-request-id, X-External-Request-Id, X-External-Session-Id], frames: [request_id, session_id, external_request_id, external_session_id]}
@@ -19,3 +20,8 @@ claims:
   tts.error.ws_frame:         {value: {status: error, keys: [message, status]}, source: https://docs.smallest.ai/models/api-reference/text-to-speech/tts}
   tts.ws.complete_terminal:   {value: server_closes, note: "complete is terminal; server closes after (except inside context_id)", source: https://docs.smallest.ai/models/api-reference/text-to-speech/tts}
   tts.ws.ping:                {value: pong, resets_timer: true, source: https://docs.smallest.ai/models/api-reference/text-to-speech/tts}
+  tts.token.ttl_s:            {value: [30, 900], default: 300, source: https://docs.smallest.ai/api-reference/token-based-authentication}
+  tts.token.ws_survives_expiry: {value: true, note: "token is checked when the connection is made", source: https://docs.smallest.ai/api-reference/token-based-authentication}
+  tts.token.expired:          {value: 401, body: {error: "Invalid or expired access token"}, source: https://docs.smallest.ai/api-reference/token-based-authentication}
+  tts.token.ws_query_param:   {value: api_key, source: https://docs.smallest.ai/api-reference/token-based-authentication}
+  tts.token.ws_query_param_alt: {value: token, note: "error reference says ?token=<KEY>", source: https://docs.smallest.ai/models/troubleshooting/error-reference}

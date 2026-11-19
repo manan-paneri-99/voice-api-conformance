@@ -8,7 +8,9 @@ Outcomes: match | mismatch | inconclusive (the procedure didn't produce the cond
 
 import asyncio
 import math
+import time
 from dataclasses import replace
+from datetime import datetime, timezone
 
 from vac.adapters.base import collect_ids
 
@@ -39,9 +41,9 @@ async def _together(*fns):
     return await asyncio.gather(*tasks)
 
 
-async def _ws_synth(adapter, req, close_wait: float = 10.0, params: dict | None = None):
+async def _ws_synth(adapter, req, close_wait: float = 10.0, params: dict | None = None, auth_header: bool = True):
     """One synthesis on a fresh socket: send, read to complete/error, then wait for the server to close."""
-    async with adapter.ws_session(params or {}) as session:
+    async with adapter.ws_session(params or {}, auth_header=auth_header) as session:
         if await session.open():
             await session.send_json(adapter.body(req))
             if await session.recv_until(_terminal, timeout=30) and close_wait:
@@ -529,5 +531,123 @@ class TTFA:
                 "outcome": outcome}
 
 
-CHECKS = {c.id: c for c in (Smoke(), Concurrency(), Limits(), ErrorShape(), WSIdleTimeout(), WSLifecycle(), TTFA())}
+def _handshake_body(cap):
+    return next((f["data"] for f in cap.frames if f.get("kind") == "handshake_body"), None)
+
+
+class TokenExpiry:
+    """Short-lived access token: query-param names, an open socket across expiry, new requests after expiry.
+    Mints one token per iteration (the mint endpoint is rate limited), so it is not part of --all."""
+    id = "tts.token_expiry"
+    default_runs = 3
+    TTL_S = 30
+    MARGIN_S = 5.0
+    NO_BACKOFF = {"complete_backoff_ms": 0}  # keeps each synthesis short so all valid-token steps fit in the TTL
+
+    def estimate(self, vendor, product, n):
+        return 7 * n, 6 * n * len(product["inputs"]["short"])  # upper bound: expired-token requests accepted
+
+    async def run(self, ctx, i):
+        short = ctx.product["inputs"]["short"]
+        mint = await ctx.adapter.mint_token(self.TTL_S)
+        received = time.perf_counter()
+        received_utc = datetime.now(timezone.utc)
+        body = mint.json if isinstance(mint.json, dict) else {}
+        token = body.get("access_token")
+        if token:
+            ctx.writer.add_secret(token)
+        expires_in = body.get("expires_in")
+        skew = None
+        if body.get("expires_at") and isinstance(expires_in, (int, float)):
+            server = datetime.fromisoformat(body["expires_at"].replace("Z", "+00:00"))
+            skew = round((server - received_utc).total_seconds() - expires_in, 2)
+        ttl_claim = ctx.claim("tts.token.ttl_s")
+        mint_req = ctx.request(self.id, "mint", i, "", "mint")
+        mint_ok = mint.status == 201 and bool(token) and expires_in == self.TTL_S
+        records = [ctx.record(mint, self.id, i, mint_req, case="mint",
+                              expected={"status": 201, "expires_in": self.TTL_S, "ttl_range": ttl_claim["value"]},
+                              observed={"status": mint.status, "token_type": body.get("token_type"),
+                                        "token_prefix": token[:4] if token else None, "expires_in": expires_in,
+                                        "expires_at": body.get("expires_at"), "server_minus_local_expiry_s": skew,
+                                        "ratelimit": {k: v for k, v in mint.headers.items() if k.startswith("ratelimit")}},
+                              outcome="match" if mint_ok else ("inconclusive" if mint.status is None else "mismatch"))]
+        if not token:
+            return records
+        tok = ctx.adapter.with_token(token)
+        records += [await self._query_param(ctx, tok, token, i, short, claim)
+                    for claim in ("tts.token.ws_query_param", "tts.token.ws_query_param_alt")]
+        expiry = received + (expires_in if isinstance(expires_in, (int, float)) else self.TTL_S) + self.MARGIN_S
+        records.append(await self._open_socket(ctx, tok, i, short, expiry))
+        records += [await self._expired_ws(ctx, tok, i, short), await self._expired_sync(ctx, tok, i, short)]
+        return records
+
+    async def _query_param(self, ctx, tok, token, i, text, claim_id):
+        name = ctx.claim(claim_id)["value"]
+        req = ctx.request(self.id, "ws", i, text, f"query_{name}", extra=self.NO_BACKOFF)
+        cap = await _ws_synth(tok, req, close_wait=0, params={name: token}, auth_header=False)
+        term = _last_terminal(cap)
+        observed = {"handshake_status": cap.handshake_status, "terminal": term.get("status") if term else None,
+                    "audio_len": len(cap.audio), "error_message": _ws_error_message(cap),
+                    "handshake_body": _handshake_body(cap)}
+        ok = cap.handshake_status == 101 and observed["terminal"] == "complete" and cap.audio
+        return ctx.record(cap, self.id, i, req, case=f"query_{name}", outcome="match" if ok else "mismatch",
+                          expected={"handshake_status": 101, "terminal": "complete", "param": name,
+                                    "source_claim": claim_id}, observed=observed)
+
+    async def _open_socket(self, ctx, tok, i, text, expiry):
+        """Header auth: one synthesis while valid, hold the socket past expiry, then a second synthesis on it."""
+        req = ctx.request(self.id, "ws", i, text, "open_socket", extra=self.NO_BACKOFF)
+        after_req = ctx.request(self.id, "ws", i, text, "open_socket-after_expiry", extra=self.NO_BACKOFF)
+        before = after = None
+        closed_during_wait = False
+        async with tok.ws_session({}) as session:
+            if await session.open():
+                await session.send_json(ctx.adapter.body(req))
+                first = await session.recv_until(_terminal, timeout=30)
+                before = first["data"]["status"] if first else None
+                closed_during_wait = await session.wait_close(max(0.0, expiry - time.perf_counter()))
+                if not closed_during_wait:
+                    await session.send_json(ctx.adapter.body(after_req))
+                    second = await session.recv_until(_terminal, timeout=30)
+                    after = second["data"]["status"] if second else (
+                        f"closed_by_{session.capture.closed_by}" if session.capture.closed_by else "no_terminal")
+        cap = session.capture
+        claim = ctx.claim("tts.token.ws_survives_expiry")
+        observed = {"before_expiry": before, "after_expiry": after, "closed_during_wait": closed_during_wait,
+                    "close_code": cap.close_code, "closed_by": cap.closed_by,
+                    "error_message": _ws_error_message(cap), "audio_len": len(cap.audio)}
+        ok = before == "complete" and after == "complete" and not closed_during_wait
+        rec = ctx.record(cap, self.id, i, req, case="open_socket", outcome=(
+            "inconclusive" if before != "complete" else ("match" if ok == claim["value"] else "mismatch")),
+            expected={"before_expiry": "complete", "after_expiry": "complete" if claim["value"] else "rejected"},
+            observed=observed)
+        if after == "complete":
+            rec["chars_sent"] += len(after_req.text)
+        return rec
+
+    async def _expired_ws(self, ctx, tok, i, text):
+        claim = ctx.claim("tts.token.expired")
+        req = ctx.request(self.id, "ws", i, text, "expired_ws", extra=self.NO_BACKOFF)
+        cap = await _ws_synth(tok, req, close_wait=0)
+        term = _last_terminal(cap)
+        observed = {"handshake_status": cap.handshake_status, "handshake_body": _handshake_body(cap),
+                    "terminal": term.get("status") if term else None, "audio_len": len(cap.audio),
+                    "error": cap.error}
+        ok = cap.handshake_status == claim["value"] and observed["handshake_body"] == claim["body"]
+        return ctx.record(cap, self.id, i, req, case="expired_ws", outcome="match" if ok else (
+            "inconclusive" if cap.handshake_status is None else "mismatch"),
+            expected={"handshake_status": claim["value"], "body": claim["body"]}, observed=observed)
+
+    async def _expired_sync(self, ctx, tok, i, text):
+        claim = ctx.claim("tts.token.expired")
+        req = ctx.request(self.id, "sync", i, text, "expired_sync")
+        cap = await tok.synth_sync(req)
+        observed = {"status": cap.status, "body": cap.json, "audio_len": len(cap.audio)}
+        ok = cap.status == claim["value"] and cap.json == claim["body"]
+        return ctx.record(cap, self.id, i, req, case="expired_sync", outcome="match" if ok else (
+            "inconclusive" if cap.status is None else "mismatch"),
+            expected={"status": claim["value"], "body": claim["body"]}, observed=observed)
+
+
+CHECKS = {c.id: c for c in (Smoke(), Concurrency(), Limits(), ErrorShape(), WSIdleTimeout(), WSLifecycle(), TTFA(), TokenExpiry())}
 ALL = ("tts.concurrency", "tts.limits", "tts.error_shape", "tts.ws_idle_timeout", "tts.ws_lifecycle", "tts.ttfa")

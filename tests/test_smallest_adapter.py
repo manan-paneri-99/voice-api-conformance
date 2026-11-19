@@ -171,3 +171,23 @@ async def test_trace_marks_new_vs_reused_connection_and_peer_ip():
     assert (first.connection, warm.connection, cold.connection) == ("new", "reused", "new")
     assert first.peer_ip == "127.0.0.1" and warm.audio == AUDIO
     assert first.timings_ms["t_connect_start"] <= first.timings_ms["t_request_sent"] <= first.timings_ms["t_headers"]
+
+
+async def test_with_token_shares_client_and_slots_and_uses_token():
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, request.headers["authorization"], request.content))
+        if request.url.path.endswith("/auth/token"):
+            return httpx.Response(201, json={"access_token": "wat_abcdefgh1234", "expires_in": 30})
+        return httpx.Response(200, content=AUDIO, headers={"content-type": "audio/wav"})
+
+    async with _adapter(handler) as a:
+        a.token_url = "https://api.smallest.ai/console/v1/auth/token"
+        mint = await a.mint_token(30)
+        tok = a.with_token(mint.json["access_token"])
+        assert tok._slots is a._slots and tok._client is a._client
+        await tok.synth_sync(_req())
+        assert tok.ws_session({"api_key": "x"}, auth_header=False)._headers == {}
+    assert seen[0] == ("/console/v1/auth/token", "Bearer plainsecretvalue123", b'{"ttl_seconds":30}')
+    assert seen[1][1] == "Bearer wat_abcdefgh1234"

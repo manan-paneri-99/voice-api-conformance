@@ -28,6 +28,7 @@ def test_mask_patterns():
     assert mask("wss://h/tts/live?token=abc123&timeout=5") == f"wss://h/tts/live?token={MASK}&timeout=5"
     assert mask("?api_key=xyz") == f"?api_key={MASK}"
     assert mask("jwt eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl") == f"jwt {MASK}"
+    assert mask('{"access_token": "wat_AbC123dEf456"}') == f'{{"access_token": "{MASK}"}}'
 
 
 def test_mask_recurses_and_keeps_non_strings():
@@ -51,3 +52,10 @@ def test_writer_header_and_records_are_masked(tmp_path):
     assert header["record"] == "header" and header["run_id"] == "r1"
     assert header["tool_version"] == "0.1.0" and header["git_sha"]
     assert record["record"] == "request" and record["body_excerpt"] == f"bad key {MASK}"
+
+
+def test_writer_masks_secret_added_mid_run(tmp_path):
+    with EvidenceWriter("r2", tmp_path) as w:
+        w.add_secret("opaque-token-xyz")
+        w.write({"body_excerpt": "token opaque-token-xyz"})
+    assert "opaque-token-xyz" not in (tmp_path / "r2.jsonl").read_text()

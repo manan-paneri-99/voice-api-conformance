@@ -13,6 +13,7 @@ MASK = "sk_..."
 
 _PATTERNS = [
     (re.compile(r"sk_[A-Za-z0-9_\-]{8,}"), MASK),
+    (re.compile(r"wat_[A-Za-z0-9_\-]{8,}"), MASK),  # short-lived access tokens
     (re.compile(r"(Bearer\s+)[^\s\"',]+", re.IGNORECASE), r"\g<1>" + MASK),
     (re.compile(r"((?:token|api_key|key)=)[^&\s\"']+", re.IGNORECASE), r"\g<1>" + MASK),
     (re.compile(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"), MASK),
@@ -78,6 +79,10 @@ class EvidenceWriter:
 
     def write(self, record: dict) -> None:
         self._write({"record": "request", **record})
+
+    def add_secret(self, secret: str) -> None:
+        """Mask this exact value from now on (e.g. an access token minted mid-run)."""
+        self.known_secrets = self.known_secrets + (secret,)
 
     def masked(self, value):
         return mask(value, self.known_secrets)

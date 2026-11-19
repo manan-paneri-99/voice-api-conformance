@@ -17,4 +17,4 @@ Start of every session:
 Python 3.11+, asyncio, httpx, websockets, pyyaml, python-dotenv, argparse. Venv in `.venv` (`python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'`). Tests: `.venv/bin/pytest` (offline only).
 
 ## Current step
-Step 6 (summarize) — done: `vac/summarize.py`, `vac summarize FILE...`; verified against the Step 2–5 evidence. Next: Step 7 (optional `tts.token_expiry`) — only if asked.
+Step 7 (optional `tts.token_expiry`) — done: run with `vac run --check tts.token_expiry` (not in `--all`; mints tokens). All SPEC build steps complete.

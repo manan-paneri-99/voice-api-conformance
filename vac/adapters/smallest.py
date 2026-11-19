@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import copy
 import json
 import time
 from urllib.parse import urlencode, urlparse
@@ -47,8 +48,9 @@ class SmallestTTS:
     def __init__(self, vendor: dict, api_key: str, transport: httpx.AsyncBaseTransport | None = None):
         self.base_url = vendor["base_url"].rstrip("/")
         self.host = urlparse(self.base_url).hostname
-        auth = vendor["auth"]
-        self._auth_headers = {auth["header"]: f"{auth['scheme']} {api_key}"}
+        self.token_url = vendor.get("token_url")
+        self._auth = vendor["auth"]
+        self._auth_headers = {self._auth["header"]: f"{self._auth['scheme']} {api_key}"}
         self._header_ids = vendor["request_id_fields"]["headers"]
         self._frame_ids = vendor["request_id_fields"]["frames"]
         self._transport = transport
@@ -64,6 +66,19 @@ class SmallestTTS:
     async def __aexit__(self, *exc):
         await self.aclose()
 
+    def with_token(self, token: str) -> "SmallestTTS":
+        """Same client and concurrency slots, authenticating with an access token instead of the key.
+        Don't close the returned adapter; it shares the parent's HTTP client."""
+        clone = copy.copy(self)
+        clone._auth_headers = {self._auth["header"]: f"{self._auth['scheme']} {token}"}
+        return clone
+
+    async def mint_token(self, ttl_seconds: int) -> HttpCapture:
+        """POST the vendor's token endpoint with the API key; the parsed body holds access_token/expires_in."""
+        cap = HttpCapture(transport="mint", url=self.token_url)
+        await self._post(cap, {"ttl_seconds": ttl_seconds}, self._read_sync, False)
+        return cap
+
     def body(self, req: TTSRequest) -> dict:
         body = {"text": req.text, "voice_id": req.voice, "sample_rate": req.sample_rate,
                 "model": req.model, "request_id": req.client_request_id}
@@ -74,27 +89,28 @@ class SmallestTTS:
     async def synth_sync(self, req: TTSRequest, fresh: bool = False) -> HttpCapture:
         """fresh=True sends on a new connection (cold); otherwise the shared client may reuse one (warm)."""
         cap = HttpCapture(transport="sync", url=f"{self.base_url}/tts")
-        await self._post(cap, req, self._read_sync, fresh)
+        await self._post(cap, self.body(req), self._read_sync, fresh)
         return cap
 
     async def synth_sse(self, req: TTSRequest, fresh: bool = False) -> StreamCapture:
         cap = StreamCapture(transport="sse", url=f"{self.base_url}/tts/live")
-        await self._post(cap, req, self._read_sse, fresh)
+        await self._post(cap, self.body(req), self._read_sse, fresh)
         return cap
 
-    def ws_session(self, url_params: dict) -> "SmallestWSSession":
+    def ws_session(self, url_params: dict, auth_header: bool = True) -> "SmallestWSSession":
+        """auth_header=False sends no Authorization header (auth via a query parameter in url_params)."""
         url = "ws" + self.base_url.removeprefix("http") + "/tts/live"
         if url_params:
             url += "?" + urlencode(url_params)
-        return SmallestWSSession(url, self._auth_headers, self._frame_ids, self._slots)
+        return SmallestWSSession(url, self._auth_headers if auth_header else {}, self._frame_ids, self._slots)
 
-    async def _post(self, cap: HttpCapture, req: TTSRequest, read_body, fresh: bool) -> None:
+    async def _post(self, cap: HttpCapture, payload: dict, read_body, fresh: bool) -> None:
         async with self._slots:
             client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, transport=self._transport) if fresh else self._client
             cap.ts_utc, cap.ts_ist = now_stamps()
             cap.timings_ms["t_send"] = _ms()
             try:
-                async with client.stream("POST", cap.url, json=self.body(req), headers=self._auth_headers,
+                async with client.stream("POST", cap.url, json=payload, headers=self._auth_headers,
                                          extensions={"trace": _tracer(cap)}) as resp:
                     cap.timings_ms["t_headers"] = _ms()
                     stream = resp.extensions.get("network_stream")

@@ -11,7 +11,7 @@ from pathlib import Path
 from vac.checks.tts import ALL, _percentile
 from vac.evidence import mask
 
-ORDER = ("smoke",) + ALL
+ORDER = ("smoke",) + ALL + ("tts.token_expiry",)
 ID_FIELDS = ("x-request-id", "request_id")
 
 
@@ -142,6 +142,10 @@ def _numbers(check: str, recs: list[dict]) -> list[str]:
     if check == "tts.ttfa":
         return [f"TTFA: {_stats(_obs(recs, 'ttfa_ms'))}", f"connect: {_stats(_obs(recs, 'connect_ms'))}",
                 f"connection: {_counts(_obs(recs, 'connection'))}", f"peer IP: {_counts(r.get('peer_ip') for r in recs)}"]
+    if check == "tts.token_expiry":
+        keys = [k for k, v in recs[0]["observed"].items()
+                if k != "status" and (not isinstance(v, (dict, list)) or k == "body")]
+        return [f"status: {_counts(r['status'] for r in recs)}"] + [f"{k}: {_counts(_obs(recs, k))}" for k in keys]
     return [f"status: {_counts(r['status'] for r in recs)}", f"duration: {_stats(durations)}"]
 
 

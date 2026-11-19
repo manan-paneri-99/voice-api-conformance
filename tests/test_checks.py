@@ -1,4 +1,5 @@
 import json
+import re
 
 from vac.checks.tts import Limits, _text_of
 from vac.runner import run_checks
@@ -153,3 +154,34 @@ async def test_ttfa_mismatch_when_slow(docs_server, vendor, product, tmp_path):
     agg = next(r for r in recs if r["record"] == "aggregate" and r["case"] == "ws_cold")
     assert agg["outcome"] == "mismatch" and agg["observed"]["checks"]["slo_p95"] is False
     assert agg["observed"]["p50_ms"] >= 350
+
+
+async def test_token_expiry_matches_docs_server(docs_server, vendor, product, tmp_path, monkeypatch):
+    from vac.checks import tts
+
+    monkeypatch.setattr(tts.TokenExpiry, "TTL_S", 1)
+    monkeypatch.setattr(tts.TokenExpiry, "MARGIN_S", 0.3)
+    docs_server.close_after_complete = False
+    path = await run_checks(docs_server.adapter, vendor, product, ["tts.token_expiry"], 1, "test", (), tmp_path)
+    text = path.read_text()
+    recs = [json.loads(line) for line in text.splitlines()][1:]
+    assert [r["case"] for r in recs] == ["mint", "query_api_key", "query_token", "open_socket", "expired_ws",
+                                         "expired_sync"]
+    assert {r["outcome"] for r in recs} == {"match"}
+    assert recs[3]["observed"]["after_expiry"] == "complete" and recs[3]["chars_sent"] == 2 * 23
+    assert recs[4]["observed"]["handshake_status"] == 401
+    assert not re.search(r"wat_[0-9a-f]{8,}", text)  # minted token masked in body, URL query and everywhere else
+
+
+async def test_token_expiry_mismatch_when_expired_token_still_works(docs_server, vendor, product, tmp_path,
+                                                                    monkeypatch):
+    from vac.checks import tts
+
+    monkeypatch.setattr(tts.TokenExpiry, "TTL_S", 1)
+    monkeypatch.setattr(tts.TokenExpiry, "MARGIN_S", 0.3)
+    docs_server.close_after_complete = False
+    docs_server.expired_tokens_work = True
+    recs = await _run(docs_server, vendor, product, "tts.token_expiry", tmp_path, runs=1)
+    by_case = {r["case"]: r for r in recs}
+    assert by_case["expired_ws"]["outcome"] == "mismatch" and by_case["expired_ws"]["observed"]["terminal"] == "complete"
+    assert by_case["expired_sync"]["outcome"] == "mismatch" and by_case["open_socket"]["outcome"] == "match"

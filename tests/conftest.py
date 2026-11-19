@@ -1,5 +1,8 @@
 import asyncio
 import json
+import secrets
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -57,6 +60,28 @@ class DocsServer:
         self.idle_default_s, self.idle_max_s = 60, 180
         self.backoff_default_ms = 4000
         self.close_after_complete = True
+        self.tokens = {}  # access token -> monotonic expiry
+        self.expired_tokens_work = False
+
+    def token_rejected(self, token: str | None) -> bool:
+        return bool(token and token.startswith("wat_")) and not self.expired_tokens_work and \
+            self.tokens.get(token, 0) < time.monotonic()
+
+    def mint(self, ttl):
+        token = f"wat_{secrets.token_hex(8)}"
+        self.tokens[token] = time.monotonic() + ttl
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=ttl)).isoformat().replace("+00:00", "Z")
+        return httpx.Response(201, json={"access_token": token, "token_type": "Bearer", "expires_in": ttl,
+                                         "expires_at": expires_at})
+
+    def process_request(self, connection, request):
+        """WS handshake: the token is checked only here, when the connection is made."""
+        query = parse_qs(urlparse(request.path).query)
+        auth = request.headers.get("Authorization", "")
+        token = auth.split(" ", 1)[1] if " " in auth else next((query[k][0] for k in ("api_key", "token") if k in query), None)
+        if self.token_rejected(token):
+            return connection.respond(401, json.dumps({"error": "Invalid or expired access token"}))
+        return None
 
     def invalid(self, body):
         if not body["text"].strip():
@@ -75,6 +100,10 @@ class DocsServer:
 
     async def http(self, request: httpx.Request):
         body = json.loads(request.content)
+        if request.url.path.endswith("/auth/token"):
+            return self.mint(body["ttl_seconds"])
+        if self.token_rejected(request.headers["authorization"].split(" ", 1)[1]):
+            return httpx.Response(401, json={"error": "Invalid or expired access token"})
         if (reason := self.invalid(body)) is not None:
             return httpx.Response(400, json={"error": "bad_request", "message": reason})
         if self.active >= self.max_active:
@@ -136,7 +165,7 @@ async def docs_server(vendor, request):
         server.backoff_default_ms = vendor["claims"]["tts.ws.complete_backoff_ms"]["default"]
     else:
         server.backoff_default_ms = 0
-    async with websockets.serve(server.ws, "127.0.0.1", 0) as ws:
+    async with websockets.serve(server.ws, "127.0.0.1", 0, process_request=server.process_request) as ws:
         port = ws.sockets[0].getsockname()[1]
         local = {**vendor, "base_url": f"http://127.0.0.1:{port}"}
         async with SmallestTTS(local, "plainsecretvalue123", transport=httpx.MockTransport(server.http)) as adapter:
