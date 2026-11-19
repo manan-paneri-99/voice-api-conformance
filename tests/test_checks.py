@@ -185,3 +185,114 @@ async def test_token_expiry_mismatch_when_expired_token_still_works(docs_server,
     by_case = {r["case"]: r for r in recs}
     assert by_case["expired_ws"]["outcome"] == "mismatch" and by_case["expired_ws"]["observed"]["terminal"] == "complete"
     assert by_case["expired_sync"]["outcome"] == "mismatch" and by_case["open_socket"]["outcome"] == "match"
+
+
+def test_turn_metrics_playback_model():
+    from base64 import b64encode
+
+    from vac.checks.tts import _turn_metrics
+
+    def chunk(t, n):
+        return {"t_ms": t, "direction": "recv", "kind": "text",
+                "data": {"status": "chunk", "data": {"audio": b64encode(b"\0" * n).decode()}}}
+
+    # sample_rate 1000 Hz -> 2 bytes/ms: each 200-byte chunk is 100 ms of audio; jitter buffer 50 ms
+    frames = [{"t_ms": 0, "direction": "send", "kind": "text", "data": {"text": "hi"}},
+              chunk(100, 200), chunk(150, 200), chunk(400, 200),
+              {"t_ms": 420, "direction": "recv", "kind": "text", "data": {"status": "complete"}}]
+    metrics, playback_end, t_terminal = _turn_metrics(frames, 1000, 50, connect_ms=30)
+    assert metrics["ttfa_ms"] == 100 and metrics["turn_start_ms"] == 130 and metrics["max_gap_ms"] == 250
+    # playhead: starts 150, +100 -> 250, +100 -> 350; third chunk arrives at 400 -> 1 underrun of 50 ms, ends 500
+    assert metrics["underruns"] == 1 and metrics["underrun_ms"] == 50 and metrics["audio_s"] == 0.3
+    assert (playback_end, t_terminal, metrics["terminal"]) == (500, 420, "complete")
+
+
+def _short_scripts(product, keepalive_s=0.2, pause_s=0.3):
+    product = {**product}
+    product["conversation"] = {"jitter_buffer_ms": 0, "keepalive_every_s": keepalive_s, "turns": [
+        {"pause_s": 0, "text": "Hello."}, {"pause_s": pause_s, "text": "Second turn."}, {"pause_s": 0.1, "text": "Bye."}]}
+    product["meeting"] = {"jitter_buffer_ms": 0, "speakers": {"a": "kelsey", "b": "spencer"}, "turns": [
+        {"speaker": "a", "pause_s": 0, "text": "Start."}, {"speaker": "b", "pause_s": 0.1, "text": "Me too."},
+        {"speaker": "a", "pause_s": 0, "text": "Together.", "overlap": True}]}
+    return product
+
+
+async def test_conversation_cases_against_docs_server(docs_server, vendor, product, tmp_path, monkeypatch):
+    from vac.checks import tts
+
+    monkeypatch.setattr(tts.Conversation, "PARALLEL", 2)
+    monkeypatch.setattr(tts.Conversation, "STAGGER_S", 0.05)
+    docs_server.close_after_complete = False
+    docs_server.max_active = 10
+    path = await run_checks(docs_server.adapter, vendor, _short_scripts(product), ["tts.conversation"], 1, "test",
+                            (), tmp_path)
+    recs = [json.loads(line) for line in path.read_text().splitlines()][1:]
+    turns = [r for r in recs if r["record"] == "request"]
+    aggs = {r["case"]: r for r in recs if r["record"] == "aggregate"}
+    assert sorted(aggs) == ["meeting", "parallel", "persistent", "reconnect"]
+    assert all(a["outcome"] == "match" and a["observed"]["failed"] == 0 for a in aggs.values())
+    persistent = [r for r in turns if r["case"] == "persistent"]
+    reconnect = [r for r in turns if r["case"] == "reconnect"]
+    assert [r["observed"]["connect_ms"] is not None for r in persistent] == [True, False, False]
+    assert all(r["observed"]["connect_ms"] is not None for r in reconnect)
+    assert any(f.get("data") == {"type": "ping"} for f in persistent[1]["frames"])  # keepalive during the pause
+    meeting = [r for r in turns if r["case"] == "meeting"]
+    assert {r["observed"]["voice"] for r in meeting} == {"kelsey", "spencer"} and len(meeting) == 3
+    assert len({r["ts_ist"] for r in persistent}) == 3  # each turn stamped at its own send, not the socket's open
+    assert all(r["observed"]["clock_jump"] is False for r in turns)
+
+
+async def test_conversation_counts_reconnect_when_socket_drops(docs_server, vendor, product, tmp_path, monkeypatch):
+    from vac.checks import tts
+
+    monkeypatch.setattr(tts.Conversation, "PARALLEL", 0)
+    docs_server.close_after_complete = False
+    docs_server.idle_default_s = 0.2
+    recs = await _run(docs_server, vendor, _short_scripts(product, keepalive_s=5, pause_s=0.5),
+                      "tts.conversation", tmp_path, runs=1)
+    persistent = next(r for r in recs if r["record"] == "aggregate" and r["case"] == "persistent")
+    assert persistent["observed"]["reconnects"] >= 1 and persistent["observed"]["failed"] == 0
+    after_drop = next(r for r in recs if r["case"] == "persistent" and "previous_socket" in r["observed"])
+    prev = after_drop["observed"]["previous_socket"]
+    assert prev["closed_by"] == "server" and any("inactivity" in json.dumps(f) for f in prev["frames"])
+
+
+async def test_conversation_inconclusive_on_clock_jump(docs_server, vendor, product, tmp_path, monkeypatch):
+    from vac.checks import tts
+
+    calls = {"n": 0}
+
+    def jumping_offset():
+        calls["n"] += 1
+        return 0.0 if calls["n"] <= 2 else 60_000.0  # the host "slept" a minute after the first turn
+
+    monkeypatch.setattr(tts, "_clock_offset_ms", jumping_offset)
+    monkeypatch.setattr(tts.Conversation, "PARALLEL", 0)
+    monkeypatch.setattr(tts.Conversation, "run_all", lambda self, ctx, n, emit: self._conversation(
+        ctx, 0, "persistent", emit))
+    docs_server.close_after_complete = False
+    recs = await _run(docs_server, vendor, _short_scripts(product), "tts.conversation", tmp_path, runs=1)
+    agg = next(r for r in recs if r["record"] == "aggregate")
+    assert agg["outcome"] == "inconclusive" and agg["observed"]["clock_jumps"] >= 1
+
+
+def test_summarize_conversation_tables(tmp_path):
+    from vac.summarize import summarize
+
+    slo = {"turn_start_max_ms": 500, "turn_start_p95_ms": 300, "max_underruns": 0, "max_gap_ms": 250,
+           "turn_success_rate": 1.0}
+    turn = {"record": "request", "run_id": "r", "check": "tts.conversation", "case": "persistent", "iteration": 0,
+            "status": 101, "outcome": "observed", "server_ids": {}, "client_request_id": "c", "error": None,
+            "observed": {"turn": 0, "turn_start_ms": 180.0, "ttfa_ms": 180.0, "max_gap_ms": 30.0, "underruns": 0,
+                         "underrun_ms": 0, "ok": True, "blocked_by_complete_ms": 0}}
+    agg = {"record": "aggregate", "check": "tts.conversation", "case": "persistent", "iteration": 0, "expected": slo,
+           "outcome": "mismatch", "observed": {
+               "turns": 12, "failed": 0, "reconnects": 0, "turn_start_p50_ms": 180, "turn_start_p95_ms": 320,
+               "turn_start_max_ms": 320, "max_gap_ms": 30, "underruns": 0, "drift_ms": 5, "blocked_by_complete_ms": 0,
+               "checks": {"turn_start_max": True, "turn_start_p95": False, "underruns": True, "max_gap": True,
+                          "turn_success": True}}}
+    path = tmp_path / "a.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in [turn, agg]))
+    out = summarize([path])
+    assert "| persistent | 0 | 12 | 0 | 0 | 180 / 320 / 320 | 30 | 0 | 5 | 0 | 0 | turn_start_p95 | mismatch |" in out
+    assert "| 0 | 180 |" in out

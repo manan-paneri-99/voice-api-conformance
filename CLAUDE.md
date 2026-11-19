@@ -17,4 +17,4 @@ Start of every session:
 Python 3.11+, asyncio, httpx, websockets, pyyaml, python-dotenv, argparse. Venv in `.venv` (`python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'`). Tests: `.venv/bin/pytest` (offline only).
 
 ## Current step
-Step 7 (optional `tts.token_expiry`) — done: run with `vac run --check tts.token_expiry` (not in `--all`; mints tokens). All SPEC build steps complete.
+Step 8 (conversation consistency) — done: `tts.conversation` (persistent, reconnect, parallel, meeting) with per-turn and per-conversation SLOs; run with `caffeinate -i` on power (≈25 min). Live run written to `evidence/`. STT is a later phase (not in this report's scope).

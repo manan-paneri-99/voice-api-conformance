@@ -7,12 +7,15 @@ Outcomes: match | mismatch | inconclusive (the procedure didn't produce the cond
 """
 
 import asyncio
+import base64
 import math
+import statistics
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
 
-from vac.adapters.base import collect_ids
+from vac.adapters.base import _strip_audio, collect_ids
+from vac.evidence import now_stamps
 
 TRANSPORTS = ("sync", "sse", "ws")
 ROUND_PAUSE_S = 2.0
@@ -649,5 +652,261 @@ class TokenExpiry:
             expected={"status": claim["value"], "body": claim["body"]}, observed=observed)
 
 
-CHECKS = {c.id: c for c in (Smoke(), Concurrency(), Limits(), ErrorShape(), WSIdleTimeout(), WSLifecycle(), TTFA(), TokenExpiry())}
+def _now_ms() -> float:
+    return time.perf_counter() * 1000
+
+
+def _clock_offset_ms() -> float:
+    """Wall clock minus perf clock. perf_counter stops while the host sleeps; a change in this offset means the host
+    slept (or the wall clock was adjusted) and timings across that moment are not trustworthy."""
+    return time.time() * 1000 - _now_ms()
+
+
+def _chunk_audio(frame: dict) -> str | None:
+    data = frame.get("data")
+    if frame.get("direction") != "recv" or not isinstance(data, dict) or data.get("status") != "chunk":
+        return None
+    audio = (data.get("data") or {}).get("audio")
+    return audio if isinstance(audio, str) else None
+
+
+def _turn_metrics(frames: list[dict], sample_rate: int, jitter_ms: float, connect_ms: float | None):
+    """Per-turn numbers from one turn's frames, plus (playback end, terminal time) in perf ms for scheduling.
+
+    Playback model: 16-bit mono PCM; playback starts at the first chunk + jitter buffer; a chunk arriving after the
+    playhead needs it is an underrun (the playhead waits for it)."""
+    send = next((f["t_ms"] for f in frames if f["direction"] == "send"
+                 and isinstance(f.get("data"), dict) and "text" in f["data"]), None)
+    after = [f for f in frames if send is not None and f["t_ms"] >= send]
+    chunks = [(f["t_ms"], len(base64.b64decode(a))) for f in after if (a := _chunk_audio(f))]
+    term = next((f for f in after if _terminal(f)), None)
+    metrics = {"terminal": term["data"]["status"] if term else None, "chunks": len(chunks), "connect_ms": connect_ms,
+               "ttfa_ms": None, "turn_start_ms": None, "max_gap_ms": None, "underruns": None, "underrun_ms": None,
+               "audio_s": None}
+    if not chunks:
+        return metrics, None, term["t_ms"] if term else None
+    bytes_per_ms = 2 * sample_rate / 1000
+    playhead = chunks[0][0] + jitter_ms
+    underruns, underrun_ms = 0, 0.0
+    for t, n in chunks:
+        if t > playhead:
+            underruns += 1
+            underrun_ms += t - playhead
+            playhead = t
+        playhead += n / bytes_per_ms
+    gaps = [b[0] - a[0] for a, b in zip(chunks, chunks[1:])]
+    ttfa = chunks[0][0] - send
+    metrics.update(ttfa_ms=round(ttfa, 1), turn_start_ms=round(ttfa + (connect_ms or 0), 1),
+                   max_gap_ms=round(max(gaps), 1) if gaps else 0.0, underruns=underruns,
+                   underrun_ms=round(underrun_ms, 1), audio_s=round(sum(n for _, n in chunks) / bytes_per_ms / 1000, 2))
+    return metrics, playhead, term["t_ms"] if term else None
+
+
+class Conversation:
+    """Scripted multi-turn conversation and a 4-speaker meeting from the product profile; SLOs judged per turn and
+    per conversation (see SPEC Step 8). Not part of --all: about 30 minutes of wall time."""
+    id = "tts.conversation"
+    default_runs = 3
+    PARALLEL = 3
+    STAGGER_S = 1.5
+    TURN_TIMEOUT_S = 60
+    CLOCK_JUMP_MS = 2000
+
+    def estimate(self, vendor, product, n):
+        conv, meet = product["conversation"]["turns"], product["meeting"]["turns"]
+        conversations = 2 * n + self.PARALLEL
+        return (conversations * len(conv) + n * len(meet),
+                conversations * sum(len(t["text"]) for t in conv) + n * sum(len(t["text"]) for t in meet))
+
+    async def run_all(self, ctx, n, emit):
+        for case in ("persistent", "reconnect"):
+            for i in range(n):
+                await self._conversation(ctx, i, case, emit)
+        await asyncio.gather(*(self._conversation(ctx, i, "parallel", emit, start_delay=i * self.STAGGER_S)
+                               for i in range(self.PARALLEL)))
+        for i in range(n):
+            await self._meeting(ctx, i, emit)
+
+    async def _wait_until(self, target_ms: float, session, keepalive_s: float | None) -> None:
+        """Wait for the next turn; on a held socket keep receiving (captured) and ping every keepalive_s."""
+        while (remaining := (target_ms - _now_ms()) / 1000) > 0:
+            if session is None or session.capture.closed_by is not None or not keepalive_s:
+                await asyncio.sleep(remaining)
+                return
+            if not await session.wait_close(min(remaining, keepalive_s)) and target_ms > _now_ms():
+                await session.send_json({"type": "ping"})
+
+    @staticmethod
+    def _usable(session) -> bool:
+        return session is not None and session.capture.handshake_status == 101 and session.capture.closed_by is None
+
+    async def _open(self, ctx):
+        session = ctx.adapter.ws_session({})
+        ok = await session.open()
+        t = session.capture.timings_ms
+        return session, (round(t["t_open"] - t["t_connect_start"], 1) if ok else None)
+
+    async def _speak(self, ctx, session, mark: int, req, connect_ms, jitter_ms, clock_base: float):
+        """One turn on an open socket. Frames since `mark` (the previous turn's end, so pings and anything the server
+        sent while we waited are kept) form this turn's evidence."""
+        cap = session.capture
+        ts_utc, ts_ist = now_stamps()
+        offset_send = _clock_offset_ms()
+        await session.send_json(ctx.adapter.body(req))
+        await session.recv_until(_terminal, timeout=self.TURN_TIMEOUT_S)
+        jump = max(abs(offset_send - clock_base), abs(_clock_offset_ms() - clock_base))
+        frames = cap.frames[mark:]
+        metrics, playback_end, t_terminal = _turn_metrics(frames, ctx.product["sample_rate"], jitter_ms, connect_ms)
+        ids = {}
+        for f in frames:
+            if f["direction"] == "recv" and isinstance(f.get("data"), dict):
+                collect_ids(ids, f["data"], session._frame_ids)
+        audio = b"".join(base64.b64decode(a) for f in frames if (a := _chunk_audio(f)))
+        part = replace(cap, frames=frames, audio=audio, server_ids=ids, ts_utc=ts_utc, ts_ist=ts_ist)
+        metrics["ok"] = metrics["terminal"] == "complete" and metrics["chunks"] > 0
+        metrics["clock_jump_ms"] = round(jump)
+        metrics["clock_jump"] = jump > self.CLOCK_JUMP_MS
+        return part, metrics, playback_end, t_terminal, len(cap.frames)
+
+    @staticmethod
+    def _dropped(session, mark: int) -> dict:
+        """What a socket that went away between turns sent after the last turn: close details and its final frames."""
+        cap = session.capture
+        return {"close_code": cap.close_code, "close_reason": cap.close_reason, "closed_by": cap.closed_by,
+                "handshake_status": cap.handshake_status, "error": cap.error,
+                "frames": [_strip_audio(f) for f in cap.frames[mark:]]}
+
+    def _next_at(self, playback_end, t_terminal, pause_s):
+        """Next turn: after playback + the next pause, but not before this turn's `complete` (the backoff)."""
+        want = (playback_end or _now_ms()) + pause_s * 1000
+        after_complete = t_terminal or _now_ms()
+        return max(want, after_complete), round(max(0.0, after_complete - want), 1)
+
+    async def _conversation(self, ctx, i, case, emit, start_delay=0.0):
+        script = ctx.product["conversation"]
+        turns_cfg = script["turns"]
+        await asyncio.sleep(start_delay)
+        session, mark, next_at, blocked, reconnects, results = None, 0, None, 0.0, 0, []
+        clock_base = _clock_offset_ms()
+        try:
+            for k, turn in enumerate(turns_cfg):
+                if next_at is not None:
+                    await self._wait_until(next_at, None if case == "reconnect" else session, script["keepalive_every_s"])
+                connect_ms, dropped = None, None
+                if not self._usable(session):
+                    if session is not None and case != "reconnect":
+                        reconnects += 1
+                        dropped = self._dropped(session, mark)
+                    if session is not None:
+                        await session.close()
+                    session, connect_ms = await self._open(ctx)
+                    mark = 0
+                req = ctx.request(self.id, "ws", i, turn["text"], f"{case}-t{k:02d}")
+                if not self._usable(session):
+                    part, metrics, end, t_term = session.capture, {"ok": False, "terminal": None}, None, None
+                else:
+                    part, metrics, end, t_term, mark = await self._speak(ctx, session, mark, req, connect_ms,
+                                                                         script["jitter_buffer_ms"], clock_base)
+                metrics |= {"turn": k, "blocked_by_complete_ms": blocked, "pause_s": turn["pause_s"]}
+                if dropped:
+                    metrics["previous_socket"] = dropped
+                results.append(metrics)
+                emit(ctx.record(part, self.id, i, req, case=case, observed=metrics, outcome="observed"))
+                if case == "reconnect":
+                    await session.close()
+                pause_next = turns_cfg[k + 1]["pause_s"] if k + 1 < len(turns_cfg) else 0
+                next_at, blocked = self._next_at(end, t_term, pause_next)
+        finally:
+            if session is not None:
+                await session.close()
+        emit(self._aggregate(ctx, case, i, results, reconnects))
+
+    async def _meeting(self, ctx, i, emit):
+        script = ctx.product["meeting"]
+        groups = []
+        for k, turn in enumerate(script["turns"]):
+            if turn.get("overlap"):
+                groups[-1].append((k, turn))
+            else:
+                groups.append([(k, turn)])
+        sessions, marks, reconnects, results = {}, {}, 0, []
+        clock_base = _clock_offset_ms()
+        try:
+            for name in script["speakers"]:
+                sessions[name], _ = await self._open(ctx)
+                marks[name] = 0
+            next_at, blocked = None, 0.0
+            for g, group in enumerate(groups):
+                if next_at is not None:
+                    await self._wait_until(next_at, None, None)
+
+                async def speak(k, turn, blocked=blocked):
+                    nonlocal reconnects
+                    name = turn["speaker"]
+                    connect_ms, dropped = None, None
+                    if not self._usable(sessions[name]):
+                        reconnects += 1
+                        dropped = self._dropped(sessions[name], marks[name])
+                        await sessions[name].close()
+                        sessions[name], connect_ms = await self._open(ctx)
+                        marks[name] = 0
+                    req = ctx.request(self.id, "ws", i, turn["text"], f"meeting-t{k:02d}", voice=script["speakers"][name])
+                    if self._usable(sessions[name]):
+                        part, metrics, end, t_term, marks[name] = await self._speak(
+                            ctx, sessions[name], marks[name], req, connect_ms, script["jitter_buffer_ms"], clock_base)
+                    else:
+                        part, metrics, end, t_term = sessions[name].capture, {"ok": False, "terminal": None}, None, None
+                    metrics |= {"turn": k, "speaker": name, "voice": req.voice, "overlap": bool(turn.get("overlap")),
+                                "blocked_by_complete_ms": blocked, "pause_s": turn["pause_s"]}
+                    if dropped:
+                        metrics["previous_socket"] = dropped
+                    results.append(metrics)
+                    emit(ctx.record(part, self.id, i, req, case="meeting", observed=metrics, outcome="observed"))
+                    return end, t_term
+
+                outs = await _together(*(lambda k=k, t=t: speak(k, t) for k, t in group))
+                ends = [e for e, _ in outs if e is not None]
+                terms = [t for _, t in outs if t is not None]
+                pause_next = groups[g + 1][0][1]["pause_s"] if g + 1 < len(groups) else 0
+                next_at, blocked = self._next_at(max(ends) if ends else None, max(terms) if terms else None, pause_next)
+        finally:
+            for s in sessions.values():
+                await s.close()
+        emit(self._aggregate(ctx, "meeting", i, sorted(results, key=lambda m: m["turn"]), reconnects))
+
+    def _aggregate(self, ctx, case, i, turns, reconnects):
+        slo = ctx.product["slo"]["conversation"]
+        starts = [t["turn_start_ms"] for t in turns if t["ok"]]
+        gaps = [t["max_gap_ms"] for t in turns if t.get("max_gap_ms") is not None]
+        underruns = sum(t.get("underruns") or 0 for t in turns)
+        success = len(starts) / len(turns) if turns else 0.0
+        third = max(1, len(starts) // 3)
+        p50 = _percentile(starts, 50)
+        observed = {
+            "turns": len(turns), "failed": len(turns) - len(starts), "reconnects": reconnects,
+            "turn_start_p50_ms": p50, "turn_start_p95_ms": _percentile(starts, 95),
+            "turn_start_max_ms": max(starts) if starts else None,
+            "ttfa_p50_ms": _percentile([t["ttfa_ms"] for t in turns if t["ok"]], 50),
+            "max_gap_ms": max(gaps) if gaps else None, "underruns": underruns,
+            "underrun_ms": round(sum(t.get("underrun_ms") or 0 for t in turns), 1),
+            "drift_ms": round(statistics.median(starts[-third:]) - statistics.median(starts[:third]), 1)
+            if len(starts) >= 3 else None,
+            "spread_ms": round(max(starts) - p50, 1) if starts else None,
+            "blocked_by_complete_ms": round(sum(t.get("blocked_by_complete_ms") or 0 for t in turns), 1),
+            "clock_jumps": sum(bool(t.get("clock_jump")) for t in turns),
+        }
+        checks = {"turn_start_max": bool(starts) and observed["turn_start_max_ms"] <= slo["turn_start_max_ms"],
+                  "turn_start_p95": bool(starts) and observed["turn_start_p95_ms"] <= slo["turn_start_p95_ms"],
+                  "underruns": underruns <= slo["max_underruns"],
+                  "max_gap": bool(gaps) and observed["max_gap_ms"] <= slo["max_gap_ms"],
+                  "turn_success": success >= slo["turn_success_rate"]}
+        # a host sleep/clock jump makes the timings untrustworthy, whatever they say
+        outcome = "inconclusive" if not starts or observed["clock_jumps"] else (
+            "match" if all(checks.values()) else "mismatch")
+        return {"record": "aggregate", "check": self.id, "case": case, "iteration": i, "status": None,
+                "server_ids": {}, "error": None, "expected": dict(slo), "observed": observed | {"checks": checks},
+                "outcome": outcome}
+
+
+CHECKS = {c.id: c for c in (Smoke(), Concurrency(), Limits(), ErrorShape(), WSIdleTimeout(), WSLifecycle(), TTFA(), TokenExpiry(), Conversation())}
 ALL = ("tts.concurrency", "tts.limits", "tts.error_shape", "tts.ws_idle_timeout", "tts.ws_lifecycle", "tts.ttfa")

@@ -4,6 +4,7 @@ Numbers only. Stored outcomes are shown as recorded; anything recomputed here is
 """
 
 import json
+import statistics
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -11,7 +12,7 @@ from pathlib import Path
 from vac.checks.tts import ALL, _percentile
 from vac.evidence import mask
 
-ORDER = ("smoke",) + ALL + ("tts.token_expiry",)
+ORDER = ("smoke",) + ALL + ("tts.token_expiry", "tts.conversation")
 ID_FIELDS = ("x-request-id", "request_id")
 
 
@@ -142,6 +143,13 @@ def _numbers(check: str, recs: list[dict]) -> list[str]:
     if check == "tts.ttfa":
         return [f"TTFA: {_stats(_obs(recs, 'ttfa_ms'))}", f"connect: {_stats(_obs(recs, 'connect_ms'))}",
                 f"connection: {_counts(_obs(recs, 'connection'))}", f"peer IP: {_counts(r.get('peer_ip') for r in recs)}"]
+    if check == "tts.conversation":
+        return [f"turn start: {_stats(_obs(recs, 'turn_start_ms'))}", f"TTFA: {_stats(_obs(recs, 'ttfa_ms'))}",
+                f"connect: {_stats(_obs(recs, 'connect_ms'))}", f"max chunk gap: {_stats(_obs(recs, 'max_gap_ms'))}",
+                f"underruns: {sum(u or 0 for u in _obs(recs, 'underruns'))} "
+                f"({sum(u or 0 for u in _obs(recs, 'underrun_ms')):g} ms)",
+                f"failed turns: {sum(not ok for ok in _obs(recs, 'ok'))}/{len(recs)}",
+                f"blocked by complete: {_stats(_obs(recs, 'blocked_by_complete_ms'))}"]
     if check == "tts.token_expiry":
         keys = [k for k, v in recs[0]["observed"].items()
                 if k != "status" and (not isinstance(v, (dict, list)) or k == "body")]
@@ -161,6 +169,37 @@ def _aggregate_table(aggs: list[dict]) -> list[str]:
         lines.append(f"| {a['case']} | {o['n']} | {o['p50_ms']} | {o['p95_ms']} | {o['min_ms']}–{o['max_ms']} | "
                      f"{'yes' if c['claim_streaming'] else 'no'} | {'yes' if c['claim_benchmark'] else 'no'} | "
                      f"{'yes' if c['slo_p95'] else 'no'} | {a['outcome']} |")
+    return lines
+
+
+def _conversation_tables(aggs: list[dict], requests: list[dict]) -> list[str]:
+    slo = aggs[0]["expected"]
+    lines = ["", f"Per conversation, judged against slo.conversation: turn start max ≤ {slo['turn_start_max_ms']} ms, "
+                 f"p95 ≤ {slo['turn_start_p95_ms']} ms, underruns ≤ {slo['max_underruns']}, max chunk gap ≤ "
+                 f"{slo['max_gap_ms']} ms, turn success ≥ {slo['turn_success_rate']}. Turn start = connect (if the turn "
+                 "opened a socket) + TTFA. Drift = median turn start of the last third minus the first third. A clock "
+                 "jump (host sleep) makes the conversation inconclusive.", "",
+             "| case | # | turns | failed | reconnects | turn start p50 / p95 / max ms | max gap ms | underruns | "
+             "drift ms | blocked by complete ms | clock jumps | SLO checks failed | outcome |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for a in aggs:
+        o = a["observed"]
+        failed = [k for k, ok in o["checks"].items() if not ok]
+        lines.append(f"| {a['case']} | {a['iteration']} | {o['turns']} | {o['failed']} | {o['reconnects']} | "
+                     f"{o['turn_start_p50_ms']} / {o['turn_start_p95_ms']} / {o['turn_start_max_ms']} | "
+                     f"{o['max_gap_ms']} | {o['underruns']} | {o['drift_ms']} | {o['blocked_by_complete_ms']} | "
+                     f"{o.get('clock_jumps', 0)} | {', '.join(failed) or '-'} | {a['outcome']} |")
+    by_turn = defaultdict(lambda: defaultdict(list))
+    for r in requests:
+        o = r.get("observed") or {}
+        if o.get("turn_start_ms") is not None:
+            by_turn[o["turn"]][r["case"]].append(o["turn_start_ms"])
+    cases = sorted({a["case"] for a in aggs}, key=["persistent", "reconnect", "parallel", "meeting"].index)
+    lines += ["", "Turn start by turn (median ms, n per cell = conversations of that case):", "",
+              "| turn | " + " | ".join(cases) + " |", "|---|" + "---|" * len(cases)]
+    for turn in sorted(by_turn):
+        cells = [f"{statistics.median(by_turn[turn][c]):g}" if by_turn[turn][c] else "-" for c in cases]
+        lines.append(f"| {turn} | " + " | ".join(cells) + " |")
     return lines
 
 
@@ -193,7 +232,9 @@ def render(headers: list[dict], records: list[dict]) -> str:
             lines.append(f"| {case} | {len(recs)} | {outcomes} | {'<br>'.join(_numbers(check, recs))} | "
                          f"{_window(recs)} | {_example_ids(recs)} |")
         check_aggs = [a for a in aggregates if a["check"] == check]
-        if check_aggs:
+        if check_aggs and check == "tts.conversation":
+            lines += _conversation_tables(check_aggs, [r for r in requests if r["check"] == check])
+        elif check_aggs:
             lines += _aggregate_table(check_aggs)
     return mask("\n".join(lines) + "\n")
 

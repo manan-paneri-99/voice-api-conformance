@@ -9,4 +9,44 @@ inputs:
 slo:
   ttfa_p95_ms: 300
   success_rate: 0.999
+  conversation:            # judged on every turn / the whole conversation (tts.conversation)
+    turn_start_max_ms: 500
+    turn_start_p95_ms: 300
+    max_underruns: 0
+    max_gap_ms: 250
+    turn_success_rate: 1.0
 budget: {max_chars_total: 200000}
+
+# Support call: agent turns; pause_s = caller speaking/thinking before the turn (after the previous turn's playback).
+conversation:
+  jitter_buffer_ms: 100
+  keepalive_every_s: 20
+  turns:
+    - {pause_s: 0, text: "Hi, thanks for calling. I'm the support assistant. How can I help you today?"}
+    - {pause_s: 4, text: "Sure, I can help with that. Could you tell me your order number?"}
+    - {pause_s: 6, text: "Thanks. One moment while I look that up."}
+    - {pause_s: 2, text: "Thanks for waiting. I checked your order, and it left our warehouse this morning. It should reach you by Thursday evening. I've sent the tracking link to your email. Is there anything else I can help with?"}
+    - {pause_s: 5, text: "Got it."}
+    - {pause_s: 3, text: "Here's how returns work. You can return any item within thirty days of delivery, as long as it's unused and in its original packaging. Start the return from the orders page, print the prepaid label, and drop the parcel at any courier point. Once the warehouse receives it, the refund goes back to your original payment method within five to seven business days. If the item arrived damaged, tell me now and I'll arrange a free pickup instead."}
+    - {pause_s: 8, text: "No problem. I've noted that the box was damaged, and a courier will collect it tomorrow between ten and two."}
+    - {pause_s: 70, text: "Are you still there? I'm happy to wait if you need a moment."}
+    - {pause_s: 2, text: "Great. Is there anything else I can help you with today?"}
+    - {pause_s: 1, text: "Sure."}
+    - {pause_s: 4, text: "Your replacement will ship as soon as the courier collects the damaged item. You'll get an email with the new tracking number, usually within a day. You don't need to place a new order."}
+    - {pause_s: 3, text: "Thanks for calling, and have a great day!"}
+
+# Meeting: four AI participants taking quick turns; overlap: true starts together with the previous turn.
+meeting:
+  jitter_buffer_ms: 100
+  speakers: {host: kelsey, finance: spencer, design: bethany, eng: henry}
+  turns:
+    - {speaker: host, pause_s: 0, text: "Okay, let's get started. Quick updates from everyone, please."}
+    - {speaker: finance, pause_s: 0.5, text: "Spend is on track. We're about four percent under budget for the quarter."}
+    - {speaker: design, pause_s: 0.4, text: "The new checkout screens are ready for review."}
+    - {speaker: eng, pause_s: 0.3, text: "And the build is green.", overlap: true}
+    - {speaker: host, pause_s: 0.6, text: "Nice. Any blockers?"}
+    - {speaker: eng, pause_s: 0.8, text: "One. The payment sandbox has been flaky since Monday, so integration tests fail about one run in five."}
+    - {speaker: finance, pause_s: 0.3, text: "Is that blocking the release date?"}
+    - {speaker: eng, pause_s: 0.5, text: "Not yet, but it will be if it isn't fixed by Friday."}
+    - {speaker: design, pause_s: 0.4, text: "I can test the screens without the sandbox.", overlap: true}
+    - {speaker: host, pause_s: 0.7, text: "Good. Let's sync again on Thursday. Thanks, everyone."}

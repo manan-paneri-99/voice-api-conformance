@@ -125,6 +125,7 @@ Each check reads its expected value from the vendor profile (and the product pro
 | `tts.ws_lifecycle` | one synthesis on WS; vary `complete_backoff_ms` | `complete` is terminal, server closes after; backoff adds ~configured delay | frame timeline, close code, who closed |
 | `tts.ttfa` | n=10 per transport (SSE, WS), product `typical` input | vendor claim and product SLO, both reported | TTFA p50/p95, connect time, cold/warm |
 | `tts.token_expiry` (optional) | short-lived token (TTL 30 s) on an open WS | documented behaviour on expiry | frames, close code |
+| `tts.conversation` | scripted multi-turn conversation (product profile); cases `persistent`, `reconnect`, `parallel`, `meeting` | product `slo.conversation`, every turn and the whole conversation | per-turn timings, chunk timeline, playback model, IDs |
 
 Guards: runner refuses to start if the estimated chars exceed the remaining `budget.max_chars_total`. Checks run sequentially. Only `tts.concurrency` runs requests in parallel (2 at once).
 
@@ -146,6 +147,37 @@ vac summarize evidence/<run_id>.jsonl             # markdown: per check n, pass/
 5. **Latency.** `tts.ttfa`.
 6. **Summarize.** `summarize.py`. Verify against step 3–5 evidence.
 7. Optional: `tts.token_expiry`.
+8. **Conversation consistency.** `tts.conversation`, product `conversation`/`meeting` scripts and `slo.conversation`, summarize table. See below.
+
+## Step 8: conversation consistency
+
+A voice agent holds one conversation, not isolated requests. The product SLOs must hold on **every turn** and across the
+**whole conversation**, first turn to last. Not part of `--all` (about 30 min wall time).
+
+Script (product profile): agent turns with text and `pause_s`, the user's speaking/thinking time before the turn. One
+pause is longer than the idle timeout. Same script every run, so runs are comparable.
+
+Turn timing (per turn):
+- **turn send** = max(previous turn's playback end + `pause_s`, previous turn's `complete` frame). `blocked_by_complete_ms`
+  records how long waiting for `complete` (its backoff) delayed the turn.
+- **TTFA** as defined above (from the text frame). **turn start** = connect time (if this turn opened a socket) + TTFA:
+  what the user waits for. The turn-start SLOs judge turn start.
+- **max gap**: longest gap between consecutive audio chunks.
+- **playback model**: PCM 16-bit mono, duration = bytes / (2 × sample_rate). Playback starts at first chunk + `jitter_buffer_ms`;
+  a chunk that arrives after the playhead needs it is an **underrun** (the playhead waits for it, then continues).
+- success = audio received and terminal frame `complete`.
+
+Per conversation (aggregate record): turn start p50/p95/max, TTFA p50/p95, max gap, underruns, drift (median turn start of
+the last third minus the first third), spread (max − p50), failed turns, reconnects, blocked_by_complete total; each
+`slo.conversation` value judged separately, outcome `match` only if all hold.
+
+Cases:
+- `persistent`: one socket for the conversation, `{"type":"ping"}` every `keepalive_every_s` during waits; if the socket
+  drops, the next turn reopens it (counted as a reconnect).
+- `reconnect`: a new socket per turn (connect time counted in turn start).
+- `parallel`: 3 persistent conversations at once, starts staggered; at most 3 sockets.
+- `meeting`: 4 speakers (one voice and one socket each) taking quick turns; a turn with `overlap: true` starts together
+  with the previous turn. At most 4 sockets.
 
 ## Later (not v1)
 

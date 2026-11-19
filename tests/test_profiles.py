@@ -66,3 +66,24 @@ def test_top_level_must_be_mapping(tmp_path):
     p.write_text("- a\n- b\n")
     with pytest.raises(ProfileError, match="top level must be a mapping"):
         load_product(p)
+
+
+@pytest.mark.parametrize("section, index, field, value, match", [
+    ("conversation", 1, "text", "  ", r"conversation.turns\[1\].text: must not be blank"),
+    ("conversation", 0, "pause_s", -1, r"pause_s: must be >= 0"),
+    ("meeting", 1, "speaker", "nobody", "is not in"),
+    ("meeting", 0, "overlap", True, "the first turn cannot overlap"),
+    ("meeting", 3, "speaker", "design", "already speaking in this overlap"),
+])
+def test_script_validation(tmp_path, section, index, field, value, match):
+    data = yaml.safe_load(PRODUCT.read_text())
+    data[section]["turns"][index][field] = value
+    with pytest.raises(ProfileError, match=match):
+        load_product(_write(tmp_path, data))
+
+
+def test_conversation_slo_values_required(tmp_path):
+    data = yaml.safe_load(PRODUCT.read_text())
+    del data["slo"]["conversation"]["max_gap_ms"]
+    with pytest.raises(ProfileError, match=r"slo.conversation: missing 'max_gap_ms'"):
+        load_product(_write(tmp_path, data))
