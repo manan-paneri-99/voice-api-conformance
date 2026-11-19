@@ -27,6 +27,20 @@ def _parse_json(raw: bytes | str):
         return None
 
 
+_TRACE_TIMINGS = {"connection.connect_tcp.started": "t_connect_start",
+                  "connection.connect_tcp.complete": "t_connect_end",
+                  "connection.start_tls.complete": "t_tls_end",
+                  "http11.send_request_body.complete": "t_request_sent"}
+
+
+def _tracer(cap: HttpCapture):
+    """httpcore trace hook: records connection and request-sent times on the capture."""
+    async def trace(event: str, info: dict) -> None:
+        if event in _TRACE_TIMINGS:
+            cap.timings_ms[_TRACE_TIMINGS[event]] = _ms()
+    return trace
+
+
 class SmallestTTS:
     name = "smallest"
 
@@ -37,6 +51,7 @@ class SmallestTTS:
         self._auth_headers = {auth["header"]: f"{auth['scheme']} {api_key}"}
         self._header_ids = vendor["request_id_fields"]["headers"]
         self._frame_ids = vendor["request_id_fields"]["frames"]
+        self._transport = transport
         self._client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, transport=transport)
         self._slots = asyncio.Semaphore(MAX_CONCURRENCY)
 
@@ -56,14 +71,15 @@ class SmallestTTS:
             body["speed"] = req.speed
         return body | req.extra
 
-    async def synth_sync(self, req: TTSRequest) -> HttpCapture:
+    async def synth_sync(self, req: TTSRequest, fresh: bool = False) -> HttpCapture:
+        """fresh=True sends on a new connection (cold); otherwise the shared client may reuse one (warm)."""
         cap = HttpCapture(transport="sync", url=f"{self.base_url}/tts")
-        await self._post(cap, req, self._read_sync)
+        await self._post(cap, req, self._read_sync, fresh)
         return cap
 
-    async def synth_sse(self, req: TTSRequest) -> StreamCapture:
+    async def synth_sse(self, req: TTSRequest, fresh: bool = False) -> StreamCapture:
         cap = StreamCapture(transport="sse", url=f"{self.base_url}/tts/live")
-        await self._post(cap, req, self._read_sse)
+        await self._post(cap, req, self._read_sse, fresh)
         return cap
 
     def ws_session(self, url_params: dict) -> "SmallestWSSession":
@@ -72,20 +88,27 @@ class SmallestTTS:
             url += "?" + urlencode(url_params)
         return SmallestWSSession(url, self._auth_headers, self._frame_ids, self._slots)
 
-    async def _post(self, cap: HttpCapture, req: TTSRequest, read_body) -> None:
+    async def _post(self, cap: HttpCapture, req: TTSRequest, read_body, fresh: bool) -> None:
         async with self._slots:
+            client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, transport=self._transport) if fresh else self._client
             cap.ts_utc, cap.ts_ist = now_stamps()
             cap.timings_ms["t_send"] = _ms()
             try:
-                async with self._client.stream("POST", cap.url, json=self.body(req),
-                                               headers=self._auth_headers) as resp:
+                async with client.stream("POST", cap.url, json=self.body(req), headers=self._auth_headers,
+                                         extensions={"trace": _tracer(cap)}) as resp:
                     cap.timings_ms["t_headers"] = _ms()
+                    stream = resp.extensions.get("network_stream")
+                    addr = stream.get_extra_info("server_addr") if stream else None
+                    cap.peer_ip = addr[0] if addr else None
                     cap.status = resp.status_code
                     cap.headers = dict(resp.headers)
                     collect_ids(cap.server_ids, cap.headers, self._header_ids)
                     await read_body(cap, resp)
             except httpx.HTTPError as exc:
                 cap.error = f"{type(exc).__name__}: {exc}"
+            finally:
+                if fresh:
+                    await client.aclose()
             cap.timings_ms["t_end"] = _ms()
 
     async def _read_sync(self, cap: HttpCapture, resp: httpx.Response) -> None:
@@ -169,6 +192,7 @@ class SmallestWSSession:
             self._release()
             return False
         cap.timings_ms["t_open"] = _ms()
+        cap.peer_ip = (self._ws.remote_address or (None,))[0]
         cap.handshake_status = self._ws.response.status_code
         cap.handshake_headers = dict(self._ws.response.headers.raw_items())
         return True

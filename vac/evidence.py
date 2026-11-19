@@ -70,11 +70,11 @@ class EvidenceWriter:
         self.path = directory / f"{run_id}.jsonl"
         self._file = self.path.open("a", encoding="utf-8")
 
-    def write_header(self, vendor_host: str, location_note: str) -> None:
+    def write_header(self, vendor_host: str, location_note: str, **extra) -> None:
         ts_utc, ts_ist = now_stamps()
         self._write({"record": "header", "tool_version": version("voice-api-conformance"), "git_sha": git_sha(),
                      "location_note": location_note, "vendor_host": vendor_host,
-                     "ts_utc": ts_utc, "ts_ist": ts_ist})
+                     "ts_utc": ts_utc, "ts_ist": ts_ist, **extra})
 
     def write(self, record: dict) -> None:
         self._write({"record": "request", **record})

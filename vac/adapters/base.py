@@ -2,6 +2,11 @@
 
 All t_* values are time.perf_counter() in milliseconds, so captures from the same
 process can be compared (e.g. overlap of two parallel requests).
+
+HTTP timings: t_send (adapter call, slot held), t_connect_start/t_connect_end/t_tls_end (only on a new
+connection), t_request_sent (request body written), t_headers, t_first_byte, t_end.
+TTFA (time to first audio) = first audio frame - t_request_sent (HTTP) or - the text frame's send time (WS).
+Connect time is recorded separately and never folded into TTFA.
 """
 
 import hashlib
@@ -36,13 +41,22 @@ class HttpCapture:
     timings_ms: dict[str, float] = field(default_factory=dict)
     server_ids: dict[str, Any] = field(default_factory=dict)
     audio: bytes = b""
+    peer_ip: str | None = None
     error: str | None = None
+
+    @property
+    def connection(self) -> str | None:
+        """'new' or 'reused', from connection trace events; None when the transport emitted none (tests)."""
+        if "t_request_sent" not in self.timings_ms:
+            return None
+        return "new" if "t_connect_start" in self.timings_ms else "reused"
 
     def evidence(self) -> dict:
         """Fields for an evidence record. Audio is summarised here; the raw bytes stay on the capture."""
         out = {
             "transport": self.transport, "url": self.url, "ts_utc": self.ts_utc, "ts_ist": self.ts_ist,
             "status": self.status, "headers": self.headers, "timings_ms": self.timings_ms,
+            "connection": self.connection, "peer_ip": self.peer_ip,
             "server_ids": self.server_ids, "audio_len": len(self.audio),
             "audio_sha256": hashlib.sha256(self.audio).hexdigest() if self.audio else None,
             "error": self.error,
@@ -77,12 +91,13 @@ class WSCapture:
     closed_by: str | None = None
     server_ids: dict[str, Any] = field(default_factory=dict)
     audio: bytes = b""
+    peer_ip: str | None = None
     error: str | None = None
 
     def evidence(self) -> dict:
         return {
             "transport": self.transport, "url": self.url, "ts_utc": self.ts_utc, "ts_ist": self.ts_ist,
-            "status": self.handshake_status, "headers": self.handshake_headers, "timings_ms": self.timings_ms,
+            "peer_ip": self.peer_ip, "status": self.handshake_status, "headers": self.handshake_headers, "timings_ms": self.timings_ms,
             "frames": [_strip_audio(f) for f in self.frames], "close_code": self.close_code,
             "close_reason": self.close_reason, "closed_by": self.closed_by, "server_ids": self.server_ids,
             "audio_len": len(self.audio),
@@ -134,6 +149,6 @@ class WSSession(Protocol):
 class TTSAdapter(Protocol):
     name: str
     def body(self, req: TTSRequest) -> dict: ...
-    async def synth_sync(self, req: TTSRequest) -> HttpCapture: ...
-    async def synth_sse(self, req: TTSRequest) -> StreamCapture: ...
+    async def synth_sync(self, req: TTSRequest, fresh: bool = False) -> HttpCapture: ...
+    async def synth_sse(self, req: TTSRequest, fresh: bool = False) -> StreamCapture: ...
     def ws_session(self, url_params: dict) -> WSSession: ...

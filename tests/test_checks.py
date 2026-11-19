@@ -125,3 +125,31 @@ async def test_ws_idle_timeout_records_reach_disk_before_check_ends(fast_ws, doc
     monkeypatch.setattr(tts.WSIdleTimeout, "_one", spy)
     await _run(docs_server, fast_ws, product, "tts.ws_idle_timeout", tmp_path, runs=1)
     assert seen == [1, 2, 3, 4]  # header, then each earlier case's record is on disk before the next starts
+
+
+def test_percentile_nearest_rank():
+    from vac.checks.tts import _percentile
+
+    values = [float(v) for v in range(1, 11)]
+    assert _percentile(values, 50) == 5 and _percentile(values, 95) == 10 and _percentile([], 50) is None
+
+
+async def test_ttfa_records_and_aggregates(docs_server, vendor, product, tmp_path):
+    docs_server.close_after_complete = False
+    recs = await _run(docs_server, vendor, product, "tts.ttfa", tmp_path, runs=3)
+    aggs = [r for r in recs if r["record"] == "aggregate"]
+    assert [a["case"] for a in aggs] == ["sse_cold", "sse_warm", "ws_cold", "ws_warm"]
+    assert all(a["observed"]["n"] == 3 and a["outcome"] == "match" for a in aggs)
+    warm = [r for r in recs if r["case"] == "ws_warm" and r["record"] == "request"]
+    assert all(r["server_ids"] == {} for r in warm)  # the fake server echoes no IDs; ours must not leak in
+    assert len(warm) == 3 and all(len([f for f in r["frames"] if f["direction"] == "send"]) == 1 for r in warm)
+    assert {r["case"] for r in recs} >= {"sse_warmup", "ws_warmup"}
+
+
+async def test_ttfa_mismatch_when_slow(docs_server, vendor, product, tmp_path):
+    docs_server.close_after_complete = False
+    docs_server.delay = 0.35
+    recs = await _run(docs_server, vendor, product, "tts.ttfa", tmp_path, runs=1)
+    agg = next(r for r in recs if r["record"] == "aggregate" and r["case"] == "ws_cold")
+    assert agg["outcome"] == "mismatch" and agg["observed"]["checks"]["slo_p95"] is False
+    assert agg["observed"]["p50_ms"] >= 350

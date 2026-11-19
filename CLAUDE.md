@@ -17,4 +17,4 @@ Start of every session:
 Python 3.11+, asyncio, httpx, websockets, pyyaml, python-dotenv, argparse. Venv in `.venv` (`python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'`). Tests: `.venv/bin/pytest` (offline only).
 
 ## Current step
-Step 4 (WS checks) — done: `tts.ws_idle_timeout`, `tts.ws_lifecycle` in `vac/checks/tts.py`; live runs written to `evidence/`. Next: Step 5 (latency, `tts.ttfa`).
+Step 5 (latency) — done: `tts.ttfa` in `vac/checks/tts.py` (SSE/WS, cold/warm, aggregate records), connection trace timings in the adapter; live run written to `evidence/`. Next: Step 6 (summarize).

@@ -7,6 +7,10 @@ Outcomes: match | mismatch | inconclusive (the procedure didn't produce the cond
 """
 
 import asyncio
+import math
+from dataclasses import replace
+
+from vac.adapters.base import collect_ids
 
 TRANSPORTS = ("sync", "sse", "ws")
 ROUND_PAUSE_S = 2.0
@@ -405,5 +409,125 @@ class WSLifecycle:
                 if t_closed and first_terminal else None}
 
 
-CHECKS = {c.id: c for c in (Smoke(), Concurrency(), Limits(), ErrorShape(), WSIdleTimeout(), WSLifecycle())}
-ALL = ("tts.concurrency", "tts.limits", "tts.error_shape", "tts.ws_idle_timeout", "tts.ws_lifecycle")
+def _percentile(values: list[float], pct: float) -> float | None:
+    """Nearest-rank percentile (with n=10, p95 is the largest sample)."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(pct / 100 * len(ordered)) - 1)]
+
+
+def _sse_ttfa_ms(cap) -> float | None:
+    start = cap.timings_ms.get("t_request_sent", cap.timings_ms.get("t_send"))
+    first = next((f["t_ms"] for f in cap.frames if isinstance(f["data"], dict) and "audio" in f["data"]), None)
+    return round(first - start, 1) if first is not None and start is not None else None
+
+
+def _ws_ttfa_ms(frames: list[dict]) -> float | None:
+    send = next((f["t_ms"] for f in frames if f["direction"] == "send"), None)
+    first = next((f["t_ms"] for f in frames if f["direction"] == "recv" and isinstance(f.get("data"), dict)
+                  and f["data"].get("status") == "chunk"), None)
+    return round(first - send, 1) if send is not None and first is not None else None
+
+
+class TTFA:
+    """Time to first audio for the product's typical input, cold and warm, over SSE and WS (spec timing defs)."""
+    id = "tts.ttfa"
+    default_runs = 10
+    CASES = ("sse_cold", "sse_warm", "ws_cold", "ws_warm")
+
+    def estimate(self, vendor, product, n):
+        typical, short = len(product["inputs"]["typical"]), len(product["inputs"]["short"])
+        return n * len(self.CASES) + 2, n * len(self.CASES) * typical + 2 * short  # +2 warm-ups
+
+    async def run_all(self, ctx, n, emit):
+        for case in self.CASES:
+            samples = await getattr(self, f"_{case}")(ctx, n, emit)
+            emit(self._aggregate(ctx, case, samples))
+
+    def _emit(self, ctx, emit, cap, i, req, case, ttfa_ms, connect_ms, connection):
+        observed = {"ttfa_ms": ttfa_ms, "connect_ms": connect_ms, "connection": connection}
+        emit(ctx.record(cap, self.id, i, req, case=case, observed=observed, outcome="observed"))
+        return ttfa_ms
+
+    async def _sse(self, ctx, n, emit, case, fresh):
+        samples = []
+        if not fresh:
+            req = ctx.request(self.id, "sse", 0, ctx.product["inputs"]["short"], "sse_warmup")
+            cap = await ctx.adapter.synth_sse(req)
+            self._emit(ctx, emit, cap, 0, req, "sse_warmup", _sse_ttfa_ms(cap), None, cap.connection)
+        for i in range(n):
+            req = ctx.request(self.id, "sse", i, ctx.product["inputs"]["typical"], case)
+            cap = await ctx.adapter.synth_sse(req, fresh=fresh)
+            t = cap.timings_ms
+            connect_ms = round(t.get("t_tls_end", t["t_connect_end"]) - t["t_connect_start"], 1) \
+                if "t_connect_start" in t and "t_connect_end" in t else None
+            ttfa = _sse_ttfa_ms(cap) if cap.status == 200 else None
+            samples.append(self._emit(ctx, emit, cap, i, req, case, ttfa, connect_ms, cap.connection))
+        return samples
+
+    async def _sse_cold(self, ctx, n, emit):
+        return await self._sse(ctx, n, emit, "sse_cold", fresh=True)
+
+    async def _sse_warm(self, ctx, n, emit):
+        return await self._sse(ctx, n, emit, "sse_warm", fresh=False)
+
+    async def _ws_cold(self, ctx, n, emit):
+        samples = []
+        for i in range(n):
+            req = ctx.request(self.id, "ws", i, ctx.product["inputs"]["typical"], "ws_cold")
+            cap = await _ws_synth(ctx.adapter, req, close_wait=0)
+            t = cap.timings_ms
+            connect_ms = round(t["t_open"] - t["t_connect_start"], 1) if "t_open" in t else None
+            samples.append(self._emit(ctx, emit, cap, i, req, "ws_cold", _ws_ttfa_ms(cap.frames), connect_ms, "new"))
+        return samples
+
+    async def _ws_warm(self, ctx, n, emit):
+        """One socket: a short warm-up synthesis, then n syntheses in a row; one record per synthesis."""
+        samples = []
+        async with ctx.adapter.ws_session({}) as session:
+            if not await session.open():
+                return samples
+            cap = session.capture
+            texts = [("ws_warmup", 0, ctx.product["inputs"]["short"])] + \
+                [("ws_warm", i, ctx.product["inputs"]["typical"]) for i in range(n)]
+            for case, i, text in texts:
+                if cap.closed_by is not None:
+                    break
+                req = ctx.request(self.id, "ws", i, text, case)
+                first_frame, first_audio = len(cap.frames), len(cap.audio)
+                await session.send_json(ctx.adapter.body(req))
+                await session.recv_until(_terminal, timeout=30)
+                frames = cap.frames[first_frame:]
+                ids = {}
+                for f in frames:
+                    if f["direction"] == "recv" and isinstance(f.get("data"), dict):
+                        collect_ids(ids, f["data"], session._frame_ids)
+                part = replace(cap, frames=frames, audio=cap.audio[first_audio:], server_ids=ids)
+                connection = "new" if case == "ws_warmup" else "reused"
+                ttfa = self._emit(ctx, emit, part, i, req, case, _ws_ttfa_ms(frames), None, connection)
+                if case == "ws_warm":
+                    samples.append(ttfa)
+        return samples
+
+    def _aggregate(self, ctx, case, samples):
+        values = [v for v in samples if v is not None]
+        stats = {"n": len(values), "failed": len(samples) - len(values), "method": "nearest-rank",
+                 "p50_ms": _percentile(values, 50), "p95_ms": _percentile(values, 95),
+                 "min_ms": min(values) if values else None, "max_ms": max(values) if values else None}
+        streaming, benchmark = ctx.claim("tts.ttfa_ms"), ctx.claim("tts.ttfa_ms.benchmark")
+        slo = ctx.product["slo"]["ttfa_p95_ms"]
+        expected = {"claim_streaming_p50_ms": streaming["value"], "claim_benchmark_p50_ms": benchmark["value"],
+                    "slo_p95_ms": slo}
+        p50, p95 = stats["p50_ms"], stats["p95_ms"]
+        checks = {"claim_streaming": p50 is not None and p50 <= streaming["value"],
+                  "claim_benchmark": p50 is not None and p50 <= benchmark["value"],
+                  "slo_p95": p95 is not None and p95 <= slo}
+        outcome = "inconclusive" if not values else ("match" if all(checks.values()) else "mismatch")
+        return {"record": "aggregate", "check": self.id, "case": case, "iteration": None, "status": None,
+                "server_ids": {}, "error": None, "expected": expected, "observed": stats | {"checks": checks},
+                "outcome": outcome}
+
+
+CHECKS = {c.id: c for c in (Smoke(), Concurrency(), Limits(), ErrorShape(), WSIdleTimeout(), WSLifecycle(), TTFA())}
+ALL = ("tts.concurrency", "tts.limits", "tts.error_shape", "tts.ws_idle_timeout", "tts.ws_lifecycle", "tts.ttfa")

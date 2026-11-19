@@ -1,6 +1,7 @@
 """Run checks n times with a credit budget guard; every request becomes one evidence record."""
 
 import json
+import socket
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +54,14 @@ class Ctx:
         return str(path)
 
 
+def _resolve(host: str) -> list[str]:
+    """IPs the vendor host resolves to from here (routing is by proximity, so this documents the region path)."""
+    try:
+        return sorted({info[4][0] for info in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)})
+    except OSError:
+        return []
+
+
 def spent_chars(evidence_dir: Path = EVIDENCE) -> int:
     """Characters already billed: chars_sent of every request record that returned audio."""
     total = 0
@@ -78,7 +87,7 @@ async def run_checks(adapter, vendor: dict, product: dict, check_ids: list[str],
 
     run_id = new_run_id()
     with EvidenceWriter(run_id, evidence_dir, known_secrets) as writer:
-        writer.write_header(vendor_host=adapter.host, location_note=location)
+        writer.write_header(vendor_host=adapter.host, location_note=location, vendor_ips=_resolve(adapter.host))
         ctx = Ctx(adapter, vendor, product, run_id, writer)
         for check, n, _, _ in plan:
             outcomes = Counter()

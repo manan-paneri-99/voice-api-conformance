@@ -142,3 +142,32 @@ async def test_ws_connect_failure_is_captured():
     assert not await s.open(timeout=2)
     assert s.capture.error and s.capture.closed_by is None
     await adapter.aclose()
+
+
+async def _keepalive_sse_server(reader, writer):
+    """Minimal HTTP/1.1 server: answers every POST with a one-frame SSE body and keeps the connection open."""
+    body = f'event: audio\ndata: {{"audio": "{B64}", "done": false}}\n\n'.encode()
+    while True:
+        head = await reader.readuntil(b"\r\n\r\n")
+        length = next(int(line.split(b":")[1]) for line in head.split(b"\r\n") if line.lower().startswith(b"content-length"))
+        await reader.readexactly(length)
+        writer.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
+                     + f"content-length: {len(body)}\r\n\r\n".encode() + body)
+        await writer.drain()
+
+
+async def test_trace_marks_new_vs_reused_connection_and_peer_ip():
+    import asyncio
+
+    server = await asyncio.start_server(_keepalive_sse_server, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        async with SmallestTTS({**VENDOR, "base_url": f"http://127.0.0.1:{port}"}, "k") as a:
+            first = await a.synth_sse(_req())
+            warm = await a.synth_sse(_req())
+            cold = await a.synth_sse(_req(), fresh=True)
+    finally:
+        server.close()
+    assert (first.connection, warm.connection, cold.connection) == ("new", "reused", "new")
+    assert first.peer_ip == "127.0.0.1" and warm.audio == AUDIO
+    assert first.timings_ms["t_connect_start"] <= first.timings_ms["t_request_sent"] <= first.timings_ms["t_headers"]

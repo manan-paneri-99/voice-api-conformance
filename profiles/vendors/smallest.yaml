@@ -10,6 +10,7 @@ claims:
   tts.ws.idle_timeout_s:      {default: 60, param: timeout, max: 180, source: https://docs.smallest.ai/models/api-reference/text-to-speech/tts}
   tts.ws.complete_backoff_ms: {default: 4000, max: 10000, source: https://docs.smallest.ai/models/api-reference/text-to-speech/tts}
   tts.ttfa_ms:                {value: 100, note: "streaming page says ~100ms; overview says ~200ms TTFB", source: https://docs.smallest.ai/models/text-to-speech/streaming}
+  tts.ttfa_ms.benchmark:      {value: 200, note: "TTFB, 40 concurrent requests, WebSocket streaming, dedicated Pro pool", source: https://docs.smallest.ai/models/text-to-speech/benchmarks/latency}
   tts.concurrency.ws:         {value: 1, on_exceed: error_frame, max_connections: 5, source: https://docs.smallest.ai/api-reference/concurrency-and-limits}
   tts.text.whitespace_only:   {value: rejected, source: https://docs.smallest.ai/models/api-reference/text-to-speech/synthesize-speech-sse}
   tts.speed.range:            {value: [0.5, 2.0], source: https://docs.smallest.ai/models/text-to-speech/sync-async}
