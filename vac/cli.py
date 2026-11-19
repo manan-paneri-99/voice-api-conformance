@@ -12,6 +12,7 @@ from vac.adapters.smallest import SmallestTTS
 from vac.checks.tts import ALL, CHECKS
 from vac.profiles import load_product, load_vendor
 from vac.runner import BudgetExceeded, run_checks
+from vac.summarize import summarize
 
 PROFILES = Path("profiles")
 
@@ -46,7 +47,12 @@ def main(argv: list[str] | None = None) -> int:
     which.add_argument("--check", action="append", choices=sorted(set(CHECKS) - {"smoke"}))
     which.add_argument("--all", action="store_true", help=f"run {', '.join(ALL)}")
     p_run.add_argument("--runs", type=int, help="iterations per check (default per check)")
+    p_sum = sub.add_parser("summarize", help="evidence JSONL -> markdown tables (no network)")
+    p_sum.add_argument("files", nargs="+", type=Path)
     args = parser.parse_args(argv)
+    if args.command == "summarize":
+        print(summarize(args.files), end="")
+        return 0
     if args.command == "smoke":
         return asyncio.run(_run(args, ["smoke"], 1))
     if args.runs is not None and args.runs < 1:
